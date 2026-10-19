@@ -1,0 +1,240 @@
+// Tests for finson. Run: finc -I ../src tests/test_lib.fin -o test_finson && ./test_finson
+import {
+    JsonValue, ParseError, ParseResult,
+    json_null, json_bool, json_num, json_num_int, json_str, json_array, json_object,
+    json_array_push, json_array_len, json_array_get,
+    json_object_set, json_object_get, json_object_has, json_object_len,
+    json_kind_name, json_free, json_free_result,
+    json_parse, json_stringify, json_stringify_pretty
+} from finson::fin;
+import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
+import { free_str, equals, len, starts_with } from strings::std;
+
+fun check_str(actual: string, expected: string, msg: string) <noret> {
+    assert_eq_string(actual, expected, msg);
+    free_str(actual);
+}
+
+fun main() <noret> {
+    // --- literals ---
+    let r <ParseResult> = json_parse("null");
+    assert_true(r.ok, "parse null: ok");
+    assert_true(equals(json_kind_name(r.value.kind), "null"), "parse null: kind");
+    json_free_result(&r);
+
+    r = json_parse("true");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "bool") && r.value.b, "parse true");
+    json_free_result(&r);
+
+    r = json_parse(" \n\tfalse\r\n ");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "bool") && !r.value.b, "parse false with whitespace");
+    json_free_result(&r);
+
+    // --- numbers ---
+    r = json_parse("42");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "number"), "parse 42: kind");
+    assert_true(r.value.num == cast<double>(42), "parse 42: value");
+    json_free_result(&r);
+
+    r = json_parse("-17");
+    assert_true(r.ok && r.value.num == cast<double>(-17), "parse -17");
+    json_free_result(&r);
+
+    r = json_parse("3.14");
+    assert_true(r.ok, "parse 3.14: ok");
+    let diff <double> = r.value.num - cast<double>(3.14);
+    if (diff < cast<double>(0)) { diff = cast<double>(0) - diff; }
+    assert_true(diff < cast<double>(0.000001), "parse 3.14: value");
+    json_free_result(&r);
+
+    r = json_parse("1e3");
+    assert_true(r.ok && r.value.num == cast<double>(1000), "parse 1e3");
+    json_free_result(&r);
+
+    r = json_parse("-2.5E-2");
+    assert_true(r.ok, "parse -2.5E-2: ok");
+    diff = r.value.num - (cast<double>(0) - cast<double>(0.025));
+    if (diff < cast<double>(0)) { diff = cast<double>(0) - diff; }
+    assert_true(diff < cast<double>(0.0000001), "parse -2.5E-2: value");
+    json_free_result(&r);
+
+    r = json_parse("0");
+    assert_true(r.ok && r.value.num == cast<double>(0), "parse 0");
+    json_free_result(&r);
+
+    // --- strings ---
+    r = json_parse("\"hello\"");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "string"), "parse string: kind");
+    assert_eq_string(r.value.s, "hello", "parse string: value");
+    json_free_result(&r);
+
+    r = json_parse("\"a\\n\\\"b\\\\c\\/d\\t\\r\"");
+    assert_true(r.ok, "parse escapes: ok");
+    assert_eq_string(r.value.s, "a\n\"b\\c/d\t\r", "parse escapes: value");
+    json_free_result(&r);
+
+    r = json_parse("\"caf\\u00e9\"");
+    assert_true(r.ok, "parse \\u00e9: ok");
+    // '\x' escapes don't exist in Fin string literals, so verify the UTF-8
+    // encoding by length (3 + 2 bytes) and ASCII prefix instead.
+    assert_eq_int(len(r.value.s), 5, "parse \\u00e9: byte length");
+    assert_true(starts_with(r.value.s, "caf"), "parse \\u00e9: prefix");
+    json_free_result(&r);
+
+    r = json_parse("\"\\u0041\"");
+    assert_true(r.ok, "parse \\u0041: ok");
+    assert_eq_string(r.value.s, "A", "parse \\u0041: value");
+    json_free_result(&r);
+
+    r = json_parse("\"\"");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "string"), "parse empty string");
+    assert_eq_string(r.value.s, "", "parse empty string: value");
+    json_free_result(&r);
+
+    // --- arrays ---
+    r = json_parse("[1, 2, 3]");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "array"), "parse array: kind");
+    assert_eq_int(json_array_len(r.value), 3, "parse array: len");
+    assert_true(json_array_get(r.value, 0).num == cast<double>(1), "parse array: [0]");
+    assert_true(json_array_get(r.value, 2).num == cast<double>(3), "parse array: [2]");
+    json_free_result(&r);
+
+    r = json_parse("[]");
+    assert_true(r.ok && json_array_len(r.value) == 0, "parse empty array");
+    json_free_result(&r);
+
+    r = json_parse("[[1], [2, 3], []]");
+    assert_true(r.ok && json_array_len(r.value) == 3, "parse nested arrays");
+    assert_eq_int(json_array_len(json_array_get(r.value, 1)), 2, "parse nested arrays: inner len");
+    json_free_result(&r);
+
+    // --- objects ---
+    r = json_parse("{\"a\": 1, \"b\": \"two\", \"c\": true, \"d\": null}");
+    assert_true(r.ok && equals(json_kind_name(r.value.kind), "object"), "parse object: kind");
+    assert_eq_int(json_object_len(r.value), 4, "parse object: len");
+    assert_true(json_object_has(r.value, "a"), "object has a");
+    assert_true(!json_object_has(r.value, "zzz"), "object missing zzz");
+    assert_true(json_object_get(r.value, "a").num == cast<double>(1), "object a == 1");
+    assert_eq_string(json_object_get(r.value, "b").s, "two", "object b == two");
+    assert_true(json_object_get(r.value, "c").b, "object c == true");
+    assert_true(equals(json_kind_name(json_object_get(r.value, "d").kind), "null"), "object d == null");
+    assert_true(json_object_get(r.value, "nope") == null, "object missing key -> null");
+    json_free_result(&r);
+
+    r = json_parse("{}");
+    assert_true(r.ok && json_object_len(r.value) == 0, "parse empty object");
+    json_free_result(&r);
+
+    r = json_parse("{\"a\": {\"b\": [1, {\"c\": 2}]}}");
+    assert_true(r.ok, "parse deep nesting: ok");
+    let inner <&JsonValue> = json_object_get(json_object_get(r.value, "a"), "b");
+    assert_true(equals(json_kind_name(inner.kind), "array") && json_array_len(inner) == 2, "deep nesting: array");
+    json_free_result(&r);
+
+    // duplicate keys: last wins
+    r = json_parse("{\"k\": 1, \"k\": 2}");
+    assert_true(r.ok, "dup keys: ok");
+    assert_true(json_object_get(r.value, "k").num == cast<double>(2), "dup keys: last wins");
+    assert_eq_int(json_object_len(r.value), 1, "dup keys: single entry");
+    json_free_result(&r);
+
+    // --- errors (line/col info, recoverable) ---
+    r = json_parse("{");
+    assert_true(!r.ok, "error: truncated object");
+    assert_eq_int(r.err.line, 1, "error: line");
+    assert_true(r.err.col > 0, "error: col");
+    assert_true(r.err.message != null, "error: message present");
+    json_free_result(&r);
+
+    r = json_parse("[1, 2,]");
+    assert_true(!r.ok, "error: trailing comma in array");
+    json_free_result(&r);
+
+    r = json_parse("{\"a\": 1,}");
+    assert_true(!r.ok, "error: trailing comma in object");
+    json_free_result(&r);
+
+    r = json_parse("\"unterminated");
+    assert_true(!r.ok, "error: unterminated string");
+    json_free_result(&r);
+
+    r = json_parse("\"bad \\q escape\"");
+    assert_true(!r.ok, "error: bad escape");
+    json_free_result(&r);
+
+    r = json_parse("nul");
+    assert_true(!r.ok, "error: bad literal");
+    json_free_result(&r);
+
+    r = json_parse("01");
+    assert_true(!r.ok, "error: leading zero");
+    json_free_result(&r);
+
+    r = json_parse("1.2.3");
+    assert_true(!r.ok, "error: double decimal point");
+    json_free_result(&r);
+
+    r = json_parse("");
+    assert_true(!r.ok, "error: empty input");
+    json_free_result(&r);
+
+    r = json_parse("   ");
+    assert_true(!r.ok, "error: whitespace only");
+    json_free_result(&r);
+
+    r = json_parse("{\"a\": 1} trailing");
+    assert_true(!r.ok, "error: trailing garbage");
+    json_free_result(&r);
+
+    r = json_parse("{\n  \"a\": tru\n}");
+    assert_true(!r.ok, "error: bad literal multiline");
+    assert_eq_int(r.err.line, 2, "error: line 2 reported");
+    json_free_result(&r);
+
+    // --- builders + serializer round-trip ---
+    let obj <&JsonValue> = json_object();
+    json_object_set(obj, "name", json_str("fin"));
+    json_object_set(obj, "version", json_num(cast<double>(0.4)));
+    json_object_set(obj, "stable", json_bool(false));
+    json_object_set(obj, "nothing", json_null());
+    let arr <&JsonValue> = json_array();
+    json_array_push(arr, json_num_int(1));
+    json_array_push(arr, json_num_int(2));
+    json_object_set(obj, "list", arr);
+    check_str(json_stringify(obj), "{\"name\":\"fin\",\"version\":0.4,\"stable\":false,\"nothing\":null,\"list\":[1,2]}", "stringify compact");
+
+    check_str(json_stringify_pretty(obj, 2),
+        "{\n  \"name\": \"fin\",\n  \"version\": 0.4,\n  \"stable\": false,\n  \"nothing\": null,\n  \"list\": [\n    1,\n    2\n  ]\n}",
+        "stringify pretty");
+
+    // replace existing key
+    json_object_set(obj, "name", json_str("finson"));
+    assert_eq_string(json_object_get(obj, "name").s, "finson", "object_set replaces");
+    assert_eq_int(json_object_len(obj), 5, "object_set replace keeps len");
+    json_free(obj);
+
+    // string escaping on output
+    let vs <&JsonValue> = json_str("a\"b\\c\n");
+    check_str(json_stringify(vs), "\"a\\\"b\\\\c\\n\"", "stringify escapes");
+    json_free(vs);
+
+    // round-trip: parse(stringify(x)) == x
+    r = json_parse("[{\"x\": [1, 2.5, \"s\", true, null]}]");
+    assert_true(r.ok, "round-trip: parse ok");
+    let s1 <string> = json_stringify(r.value);
+    let r2 <ParseResult> = json_parse(s1);
+    assert_true(r2.ok, "round-trip: reparse ok");
+    let s2 <string> = json_stringify(r2.value);
+    assert_eq_string(s1, s2, "round-trip: stable");
+    free_str(s1);
+    free_str(s2);
+    json_free_result(&r);
+    json_free_result(&r2);
+
+    // kind names
+    assert_eq_string(json_kind_name(0), "null", "kind_name null");
+    assert_eq_string(json_kind_name(4), "array", "kind_name array");
+    assert_true(!equals(json_kind_name(1), "nope"), "kind_name bool sane");
+
+    printf("finson: all tests passed\n");
+}

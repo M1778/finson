@@ -1,0 +1,5 @@
+.finn/
+out/
+*.o
+*.exe
+test_finson

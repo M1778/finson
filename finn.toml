@@ -1,0 +1,10 @@
+[project]
+name = "finson"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "finson.fin"
+
+[packages]
+
+[scripts]
+test = "finc -I src tests/test_lib.fin -o test_finson && ./test_finson"

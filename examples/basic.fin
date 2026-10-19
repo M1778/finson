@@ -1,0 +1,40 @@
+// finson example: parse a JSON document, read fields, modify it, print it back.
+import {
+    JsonValue, ParseResult,
+    json_parse, json_stringify, json_stringify_pretty,
+    json_object_get, json_array_get, json_array_len,
+    json_object_set, json_str, json_num, json_num_int, json_free_result
+} from finson::fin;
+import { free_str } from strings::std;
+
+fun main() <noret> {
+    let doc <string> = "{\"name\": \"finson\", \"stars\": 0, \"tags\": [\"json\", \"fin\"]}";
+
+    let r <ParseResult> = json_parse(doc);
+    if (!r.ok) {
+        printf("parse failed at %d:%d: %s\n", r.err.line, r.err.col, r.err.message);
+        json_free_result(&r);
+        return;
+    }
+
+    let name <&JsonValue> = json_object_get(r.value, "name");
+    printf("name: %s\n", name.s);
+
+    let tags <&JsonValue> = json_object_get(r.value, "tags");
+    printf("tags: %d\n", json_array_len(tags));
+    for (let i <int> = 0; i < json_array_len(tags); i++) {
+        printf("  - %s\n", json_array_get(tags, i).s);
+    }
+
+    // Modify: bump the star count and add a field.
+    // (Note: float->int casts don't lower in finc 0.4.0, so we stay in doubles.)
+    let stars <&JsonValue> = json_object_get(r.value, "stars");
+    json_object_set(r.value, "stars", json_num(stars.num + cast<double>(1)));
+    json_object_set(r.value, "lang", json_str("fin"));
+
+    let pretty <string> = json_stringify_pretty(r.value, 2);
+    printf("%s\n", pretty);
+    free_str(pretty);
+
+    json_free_result(&r);
+}
