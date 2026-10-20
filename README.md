@@ -4,9 +4,9 @@ JSON parsing and serialization for [Fin](https://github.com/M1778/Fin). Parse JS
 text into a `JsonValue` tree, build values programmatically, and serialize back to
 compact or pretty-printed JSON.
 
->
-> **Verification status:** ✅ VERIFIED — built with `finc 0.4.0` (contract 3);
-> full test suite passes. CI also builds finc from source and re-runs everything.
+> **Verification status:** built with the frozen `finc 0.4.0` (contract 3)
+> toolchain on Linux at `-O0` and `-O2`; native regression and Python differential
+> suites pass, including leak-checked repeated parse/serialize/free loops.
 
 ## Install
 
@@ -30,7 +30,7 @@ fun main() <noret> {
     let r <ParseResult> = json_parse("{\"name\": \"fin\", \"stars\": 41}");
     if (!r.ok) {
         printf("parse failed at %d:%d: %s\n", r.err.line, r.err.col, r.err.message);
-        json_free_result(r);
+        json_free_result(&r);
         return;
     }
     let name <&JsonValue> = json_object_get(r.value, "name");
@@ -38,9 +38,13 @@ fun main() <noret> {
 
     json_object_set(r.value, "lang", json_str("fin"));
     let pretty <string> = json_stringify_pretty(r.value, 2);
-    printf("%s\n", pretty);
-    free_str(pretty);
-    json_free_result(r);
+    if (pretty != null) {
+        printf("%s\n", pretty);
+        free_str(pretty);
+    } else {
+        printf("serialization failed\n");
+    }
+    json_free_result(&r);
 }
 ```
 
@@ -61,23 +65,73 @@ fun main() <noret> {
 ### Parsing
 
 ```fin
-fun json_parse(text: string) <ParseResult>
+fun json_parse(text: string) <ParseResult> // bounded, duplicate keys: last wins
+fun json_parse_strict(text: string) <ParseResult> // bounded, duplicate keys rejected
+fun json_default_limits() <JsonLimits>
+fun json_parse_with_limits(text: string, limits: JsonLimits) <ParseResult>
 ```
 
-Parses a complete JSON document. Errors are recoverable: check `r.ok`, and on
-failure `r.err` carries 1-based `line`/`col` and a human-readable `message`.
-Release with `json_free_result(r)`.
+Parses a complete NUL-terminated JSON document. Errors are recoverable: check
+`r.ok`; `r.err` carries 1-based byte `line`/`col` and an owned diagnostic.
+Release success or failure with `json_free_result(&r)`. For security-sensitive
+claims use `json_parse_strict`: duplicate names are compared after escape decoding
+at every nesting level. `json_parse` retains last-wins compatibility.
+
+`JsonLimits` is a value struct with configurable budgets:
+
+| Field | Default | Maximum accepted configuration |
+| --- | ---: | ---: |
+| `max_bytes` | 1,048,576 | 67,108,864 |
+| `max_depth` | 128 | 256 |
+| `max_nodes` | 65,536 | 1,048,576 |
+| `max_container` | 16,384 | 1,048,576 |
+| `max_output` | 8,388,608 | 67,108,864 |
+| `reject_duplicates` | false | boolean |
+
+Zero budgets are valid; negatives and configurations above hard ceilings return
+errors. Depth counts open containers (a scalar root has depth zero). Nodes count
+values, including the root and replaced duplicate values; container budgets count
+input members including duplicate names. `max_bytes` is checked before copying
+input. `max_output` applies to serialization, not parsing. Serializers also enforce
+depth/node/container budgets. Object lookup and duplicate detection remain linear
+per member (quadratic for a wide object); lower `max_container` for hostile traffic.
+
+Because Fin strings carry no length, escaped U+0000 is rejected in values and keys
+instead of being silently truncated. Callers holding raw bytes must reject literal
+NUL **before** converting them to `string`: a NUL-terminated API cannot inspect the
+suffix. Invalid UTF-8, unpaired surrogates and overflow to nonfinite doubles are
+recoverable errors. Allocation failure in Fin's `new`/stdlib remains a runtime
+limitation; budgets bound requested work but are not a general OOM recovery API.
 
 ### Serialization
 
 ```fin
-fun json_stringify(v: &JsonValue) <string>              // compact
-fun json_stringify_pretty(v: &JsonValue, indent: int) <string>  // pretty, N spaces
+fun json_stringify(v: &JsonValue) <string> // compact, null on failure
+fun json_stringify_pretty(v: &JsonValue, indent: int) <string> // null on failure
+fun json_stringify_strict(v: &JsonValue) <StringifyResult>
+fun json_stringify_with_limits(v: &JsonValue, limits: JsonLimits,
+                              pretty: bool, indent: int) <StringifyResult>
+fun json_free_stringify_result(r: &StringifyResult) <noret>
 ```
 
-Both return a freshly allocated string — free it with `strings::std.free_str`
-(or C `free`). Strings are escaped per RFC 8259 (`\"`, `\\`, `\n`, `\u00XX`,
-...); non-ASCII UTF-8 bytes pass through unchanged.
+`StringifyResult` has `ok`, `text`, and `message`; successful text or failed
+message is owned. Release either outcome with `json_free_stringify_result(&r)`.
+Compatibility wrappers return freshly allocated text on success (free with
+`strings::std.free_str`) or **null** on failure, never partial/invalid JSON.
+Invalid UTF-8, nonfinite numbers, negative/over-budget indentation and exhausted
+budgets return errors. Programmatically built cycles are rejected by the depth
+budget during serialization, but remain invalid ownership graphs: do not pass
+cycles or shared children to `json_free`.
+
+Strings are escaped per RFC 8259. Finite doubles use libc `strtod` and `%.17g`:
+subnormal values and negative zero survive round trips; integers beyond 2^53 may
+lose precision; underflow below representable doubles rounds to zero. Decimal
+output can be longer than before (`0.4` may become `0.40000000000000002`).
+JSON operations require a **dot-decimal numeric locale** (the process default C
+locale works). A non-dot locale returns an explicit error; the library never
+changes global or thread locale. Applications must not concurrently call
+`setlocale` while using JSON. Native Linux libc ABI is tested; `strnlen` and the
+C conversion/formatting functions must be available on other targets.
 
 ### Building values
 
@@ -116,26 +170,45 @@ yours — free it exactly once. `json_object_set` copies keys and takes ownershi
 of the inserted value; replacing a key frees the old value. `json_object_get`
 and `json_array_get` return borrowed pointers (do not free them separately).
 
+`json_array_push` also takes ownership. All children must be distinct allocations
+with one owner; inserting a value into itself or into multiple parents is invalid.
+Setting an existing key to its current pointer is a no-op. Constructors/accessors
+and scalar `kind`/`b`/`num`/`s` fields retain their signatures, but `JsonValue`
+storage changed: `items`, `keys`, and `vals` are now explicitly freed arrays with
+`count`/`capacity`, not `Collection` pointers. Direct storage access is unsupported;
+rebuild consumers and use the accessors. Result cleanup clears owned pointers and
+can safely be repeated.
+
 ## Supported JSON
 
-- Full RFC 8259 grammar: objects, arrays, strings with escapes (including
-  `\uXXXX` with surrogate-pair handling), numbers (int/frac/exp), literals.
-- Duplicate object keys: last one wins (documented behavior).
-- Numbers are `double`; very large integers lose precision past 2^53.
-- `\u` escapes outside the Basic Multilingual Plane combine surrogate pairs;
-  lone surrogates are parse errors.
+- RFC 8259 grammar within documented budgets, excluding U+0000 which cannot be
+  represented by this API; strict valid UTF-8 is required.
+- Duplicate object keys: last wins by default, rejected by strict mode.
+- Numbers are finite `double`; very large integers lose precision past 2^53.
+- Surrogate-pair escapes combine; lone surrogates are parse errors.
 
 ## Dependencies
 
-- Fin standard library only (`collection::std`, `strings::std`, `testing::std`
-  for tests). No third-party packages.
+- Fin standard library (`strings::std`, `testing::std` for tests).
+- C runtime (`strtod`, `snprintf`, `strnlen`, `calloc`, `free`).
+- Python 3 standard library for differential tests. No third-party packages.
 
 ## Development
 
 ```sh
-finn test          # type-check tests/ (once finn codegen lands)
-finc -I src tests/test_lib.fin -o test_finson && ./test_finson
+finc -O0 -I src tests/test_lib.fin -o test_finson && ./test_finson
+python3 -I tests/differential.py ./test_finson
+finc -O2 -I src tests/test_lib.fin -o test_finson && ./test_finson
+python3 -I tests/differential.py ./test_finson
 ```
+
+Pin the intended standard library with `--fin-libs /path/to/lib/std` when using a
+frozen compiler. To check ownership on Linux, compile with `-c`, then link the
+object using `cc -fsanitize=leak test_finson.o -o test_finson` and run both suites.
+The native suite includes 2,000 successful parse/serialize/free cycles plus 6,000
+failed-parse cleanup cycles. The differential suite compares generated Unicode,
+nested values and binary64 numbers against Python JSON. `FINSON_TEST_LOCALE`
+selects an installed non-dot locale for an explicit rejection test.
 
 ## Changelog
 

@@ -1,452 +1,352 @@
-// finson — JSON parsing and serialization for Fin.
-//
-// A small, dependency-free JSON library: parse JSON text into a JsonValue
-// tree, build values programmatically, and serialize back to compact or
-// pretty-printed JSON. Parse errors are recoverable values (a ParseResult),
-// never aborts.
-//
-// Design notes for Fin v0.4.0:
-//   * The public API is plain functions, imported by name
-//     (`import { json_parse } from lib::finson;`). By-name calls of imported
-//     Fin functions are the import spelling the backend supports; qualified
-//     calls (finson.json_parse(...)) are refused.
-//   * JsonValue is a tagged struct, not a payload enum: payload/generic enums
-//     type-check but are refused by the backend at runtime.
-//   * Every malloc'd string is owned by its holder. json_parse's result must
-//     be released with json_free / json_free_result; json_stringify's result
-//     with strings::std.free_str (or free()).
-
-import { Collection } from collection::std;
-import { len, equals, clone, substr, to_chars, from_chars, free_str } from strings::std;
+// finson — bounded JSON parsing and serialization for Fin.
+// Values own their strings and child arrays; accessors return borrowed pointers.
+// Strings are NUL-terminated: embedded NUL is rejected, never silently truncated.
+import { clone, equals, to_chars, from_chars } from strings::std;
 
 namespace fin {
 
-// ---------------------------------------------------------------------------
-// Local C bindings (module-private). Declared here rather than imported so
-// this module never depends on an extern lowering through an import.
-// ---------------------------------------------------------------------------
-
 #[llvm_name="calloc"]
 @define json_calloc(count: ulong, size: ulong) <string>;
-
 #[llvm_name="free"]
 @define json_cfree(p: string) <noret>;
-
 #[llvm_name="snprintf"]
 @define json_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+#[llvm_name="strtod"]
+@define json_strtod(text: string, end: &string) <double>;
+#[llvm_name="strnlen"]
+@define json_strnlen(text: string, bound: ulong) <ulong>;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-// JSON value kinds are plain ints (finc 0.4.0 does not lower `const`
-// declarations from an imported module, not even private ones):
-// 0=null, 1=bool, 2=number, 3=string, 4=array, 5=object.
-// Use json_kind_name() for a readable name.
-
+// kind: 0=null, 1=bool, 2=number, 3=string, 4=array, 5=object.
+// Child arrays are implementation storage. Use the public accessors, not their
+// capacity or contents directly. Each child must have exactly one owner.
 #[export]
 pub struct JsonValue {
     pub:
-        kind <int>,
-        b <bool>,
-        num <double>,
-        s <string>,
-        // Array elements.
-        items <&Collection<&JsonValue>>,
-        // Object entries as parallel collections: keys[i] belongs to vals[i].
-        // (A Collection<JsonPair> would need struct ==, which the backend
-        // refuses to lower.)
-        keys <&Collection<string>>,
-        vals <&Collection<&JsonValue>>,
+        kind <int>, b <bool>, num <double>, s <string>,
+        items <[&JsonValue]>, keys <[string]>, vals <[&JsonValue]>,
+        count <int>, capacity <int>,
 }
-
 #[export]
 pub struct ParseError {
+    pub: line <int>, col <int>, message <string>,
+}
+#[export]
+pub struct ParseResult {
+    pub: ok <bool>, value <&JsonValue>, err <ParseError>,
+}
+#[export]
+pub struct JsonLimits {
     pub:
-        line <int>,
-        col <int>,
-        message <string>,
+        max_bytes <int>, max_depth <int>, max_nodes <int>,
+        max_container <int>, max_output <int>, reject_duplicates <bool>,
+}
+#[export]
+pub struct StringifyResult {
+    pub: ok <bool>, text <string>, message <string>,
 }
 
 #[export]
-pub struct ParseResult {
-    pub:
-        ok <bool>,
-        value <&JsonValue>,
-        err <ParseError>,
+pub fun json_default_limits() <JsonLimits> {
+    return JsonLimits{max_bytes: 1048576, max_depth: 128, max_nodes: 65536,
+                      max_container: 16384, max_output: 8388608, reject_duplicates: false};
 }
 
-// ---------------------------------------------------------------------------
-// Constructors — every value is heap-allocated and owned by the caller.
-// ---------------------------------------------------------------------------
+// Hard ceilings bound recursion and signed arithmetic even with custom limits.
+fun json_limits_valid(limits: JsonLimits) <bool> {
+    return limits.max_bytes >= 0 && limits.max_bytes <= 67108864 &&
+           limits.max_depth >= 0 && limits.max_depth <= 256 &&
+           limits.max_nodes >= 0 && limits.max_nodes <= 1048576 &&
+           limits.max_container >= 0 && limits.max_container <= 1048576 &&
+           limits.max_output >= 0 && limits.max_output <= 67108864;
+}
+
+fun json_null_string() <string> { let s <string> = null; return s; }
+
+fun json_finite(n: double) <bool> {
+    return n == n && n - n == cast<double>(0);
+}
+
+// Use libc conversion without changing global/thread locale. A non-dot numeric
+// locale is explicitly unsupported. Callers must not race setlocale with JSON.
+fun json_numeric_locale_ok() <bool> {
+    let tmp <string> = json_calloc(cast<ulong>(16), cast<ulong>(1));
+    if (tmp == null) { return false; }
+    let written <int> = json_snprintf(tmp, cast<ulong>(16), "%.1f", cast<double>(1.5));
+    let ok <bool> = written == 3 && equals(tmp, "1.5");
+    json_cfree(tmp);
+    return ok;
+}
 
 #[export]
 pub fun json_null() <&JsonValue> {
-    return new JsonValue{kind: 0, b: false, num: cast<double>(0),
-                        s: null, items: null, keys: null, vals: null};
+    return new JsonValue{kind: 0, b: false, num: cast<double>(0), s: null,
+                         count: 0, capacity: 0};
 }
-
 #[export]
 pub fun json_bool(b: bool) <&JsonValue> {
-    return new JsonValue{kind: 1, b: b, num: cast<double>(0),
-                        s: null, items: null, keys: null, vals: null};
+    let v <&JsonValue> = json_null(); v.kind = 1; v.b = b; return v;
 }
-
 #[export]
 pub fun json_num(n: double) <&JsonValue> {
-    return new JsonValue{kind: 2, b: false, num: n,
-                        s: null, items: null, keys: null, vals: null};
+    let v <&JsonValue> = json_null(); v.kind = 2; v.num = n; return v;
 }
-
 #[export]
-pub fun json_num_int(n: int) <&JsonValue> {
-    return json_num(cast<double>(n));
-}
-
-// Copies `s`; the caller keeps ownership of the argument.
+pub fun json_num_int(n: int) <&JsonValue> { return json_num(cast<double>(n)); }
 #[export]
 pub fun json_str(s: string) <&JsonValue> {
-    return new JsonValue{kind: 3, b: false, num: cast<double>(0),
-                        s: clone(s), items: null, keys: null, vals: null};
+    let v <&JsonValue> = json_null(); v.kind = 3; v.s = clone(s); return v;
 }
-
 #[export]
 pub fun json_array() <&JsonValue> {
-    return new JsonValue{kind: 4, b: false, num: cast<double>(0),
-                        s: null, items: new Collection::<&JsonValue>{}, keys: null, vals: null};
+    let v <&JsonValue> = json_null(); v.kind = 4; return v;
 }
-
 #[export]
 pub fun json_object() <&JsonValue> {
-    return new JsonValue{kind: 5, b: false, num: cast<double>(0),
-                        s: null, items: null,
-                        keys: new Collection::<string>{}, vals: new Collection::<&JsonValue>{}};
+    let v <&JsonValue> = json_null(); v.kind = 5; return v;
 }
 
-// ---------------------------------------------------------------------------
-// Mutation and access
-// ---------------------------------------------------------------------------
-
+fun json_children_reserve(v: &JsonValue) <noret> {
+    if (v.count < v.capacity) { return; }
+    // Public builders are trusted APIs; parsing checks its lower budget first.
+    blame v.count < 1048576, "JSON builder container limit exceeded";
+    let cap <int> = v.capacity * 2;
+    if (cap < 4) { cap = 4; }
+    if (v.kind == 4) {
+        let next <[&JsonValue]> = new [&JsonValue, cap]{};
+        for (let i <int> = 0; i < v.count; i++) { next[i] = v.items[i]; }
+        if (v.items != null) { delete v.items; }
+        v.items = next;
+    } else {
+        let keys <[string]> = new [string, cap]{};
+        let vals <[&JsonValue]> = new [&JsonValue, cap]{};
+        for (let i <int> = 0; i < v.count; i++) { keys[i] = v.keys[i]; vals[i] = v.vals[i]; }
+        if (v.keys != null) { delete v.keys; }
+        if (v.vals != null) { delete v.vals; }
+        v.keys = keys; v.vals = vals;
+    }
+    v.capacity = cap;
+}
 #[export]
 pub fun json_array_push(v: &JsonValue, item: &JsonValue) <noret> {
     blame v != null, "json_array_push: null value";
     blame v.kind == 4, "json_array_push: not an array";
-    v.items.push(item);
+    json_children_reserve(v); v.items[v.count] = item; v.count++;
 }
-
 #[export]
 pub fun json_array_len(v: &JsonValue) <int> {
     blame v != null, "json_array_len: null value";
     blame v.kind == 4, "json_array_len: not an array";
-    return v.items.len();
+    return v.count;
 }
-
 #[export]
 pub fun json_array_get(v: &JsonValue, i: int) <&JsonValue> {
     blame v != null, "json_array_get: null value";
     blame v.kind == 4, "json_array_get: not an array";
-    return v.items.get(i);
+    blame i >= 0 && i < v.count, "json_array_get: index out of bounds";
+    return v.items[i];
 }
-
-// Inserts or replaces `key`. The key is copied; a replaced value is freed.
 #[export]
 pub fun json_object_set(v: &JsonValue, key: string, item: &JsonValue) <noret> {
     blame v != null, "json_object_set: null value";
     blame v.kind == 5, "json_object_set: not an object";
-    let n <int> = v.keys.len();
-    for (let i <int> = 0; i < n; i++) {
-        if (equals(v.keys.get(i), key)) {
-            json_free(v.vals.get(i));
-            v.vals.set(i, item);
+    for (let i <int> = 0; i < v.count; i++) {
+        if (equals(v.keys[i], key)) {
+            if (v.vals[i] != item) { json_free(v.vals[i]); v.vals[i] = item; }
             return;
         }
     }
-    v.keys.push(clone(key));
-    v.vals.push(item);
+    json_children_reserve(v);
+    // Keep allocation outside indexed assignment: finc -O0 can evaluate a call
+    // on the right-hand side twice while lowering that assignment.
+    let owned_key <string> = clone(key);
+    v.keys[v.count] = owned_key; v.vals[v.count] = item; v.count++;
 }
-
-// Returns the value for `key`, or null when the key is absent.
 #[export]
 pub fun json_object_get(v: &JsonValue, key: string) <&JsonValue> {
     blame v != null, "json_object_get: null value";
     blame v.kind == 5, "json_object_get: not an object";
-    let n <int> = v.keys.len();
-    for (let i <int> = 0; i < n; i++) {
-        if (equals(v.keys.get(i), key)) {
-            return v.vals.get(i);
-        }
+    for (let i <int> = 0; i < v.count; i++) {
+        if (equals(v.keys[i], key)) { return v.vals[i]; }
     }
     return null;
 }
-
 #[export]
-pub fun json_object_has(v: &JsonValue, key: string) <bool> {
-    return json_object_get(v, key) != null;
-}
-
+pub fun json_object_has(v: &JsonValue, key: string) <bool> { return json_object_get(v, key) != null; }
 #[export]
 pub fun json_object_len(v: &JsonValue) <int> {
     blame v != null, "json_object_len: null value";
     blame v.kind == 5, "json_object_len: not an object";
-    return v.keys.len();
+    return v.count;
 }
-
-// Static string — do NOT free the result.
 #[export]
 pub fun json_kind_name(k: int) <string> {
-    if (k == 0) { return "null"; }
-    if (k == 1) { return "bool"; }
-    if (k == 2) { return "number"; }
-    if (k == 3) { return "string"; }
-    if (k == 4) { return "array"; }
-    return "object";
+    if (k == 0) { return "null"; } if (k == 1) { return "bool"; }
+    if (k == 2) { return "number"; } if (k == 3) { return "string"; }
+    if (k == 4) { return "array"; } if (k == 5) { return "object"; }
+    return "invalid";
 }
-
-// ---------------------------------------------------------------------------
-// Memory — release a parsed/built tree. Frees strings, pairs, children.
-// ---------------------------------------------------------------------------
-
 #[export]
 pub fun json_free(v: &JsonValue) <noret> {
     if (v == null) { return; }
-    if (v.kind == 3) {
-        json_cfree(v.s);
-    }
+    if (v.kind == 3) { json_cfree(v.s); }
     if (v.kind == 4) {
-        let n <int> = v.items.len();
-        for (let i <int> = 0; i < n; i++) {
-            json_free(v.items.get(i));
-        }
-        delete v.items;
+        for (let i <int> = 0; i < v.count; i++) { json_free(v.items[i]); }
+        if (v.items != null) { delete v.items; }
     }
     if (v.kind == 5) {
-        let n <int> = v.keys.len();
-        for (let i <int> = 0; i < n; i++) {
-            json_cfree(v.keys.get(i));
-            json_free(v.vals.get(i));
-        }
-        delete v.keys;
-        delete v.vals;
+        for (let i <int> = 0; i < v.count; i++) { json_cfree(v.keys[i]); json_free(v.vals[i]); }
+        if (v.keys != null) { delete v.keys; }
+        if (v.vals != null) { delete v.vals; }
     }
     delete v;
 }
-
-// Releases whichever side of a ParseResult is live.
 #[export]
 pub fun json_free_result(r: &ParseResult) <noret> {
-    if (r.ok) {
-        json_free(r.value);
-    } else {
-        json_cfree(r.err.message);
-    }
+    if (r.ok) { json_free(r.value); } else { json_cfree(r.err.message); }
+    r.ok = false; r.value = null; r.err.message = json_null_string();
 }
-
-// ---------------------------------------------------------------------------
-// Internal: growable byte buffer for the parser and serializer.
-// ---------------------------------------------------------------------------
+#[export]
+pub fun json_free_stringify_result(r: &StringifyResult) <noret> {
+    json_cfree(r.text); json_cfree(r.message); r.ok = false; r.text = json_null_string(); r.message = json_null_string();
+}
 
 struct JsonBuf {
-    data <[char]>,
-    len <int>,
-    cap <int>,
+    data <[char]>, len <int>, cap <int>, limit <int>, failed <bool>, message <string>,
 }
-
-fun json_buf_new() <&JsonBuf> {
-    let cap <int> = 64;
-    return new JsonBuf{data: new [char, cap]{}, len: 0, cap: cap};
+fun json_buf_new(limit: int) <&JsonBuf> {
+    return new JsonBuf{len: 0, cap: 0, limit: limit, failed: false, message: json_null_string()};
 }
-
-fun json_buf_reserve(b: &JsonBuf, extra: int) <noret> {
-    if (b.len + extra <= b.cap) { return; }
-    let want <int> = b.cap * 2;
-    while (want < b.len + extra) { want = want * 2; }
-    let nd <[char]> = new [char, want]{};
-    for (let i <int> = 0; i < b.len; i++) { nd[i] = b.data[i]; }
-    delete b.data;
-    b.data = nd;
-    b.cap = want;
+fun json_buf_fail(b: &JsonBuf, message: string) <noret> {
+    if (!b.failed) { b.failed = true; b.message = message; }
 }
-
+fun json_buf_reserve(b: &JsonBuf, extra: int) <bool> {
+    if (b.failed) { return false; }
+    if (extra < 0 || extra > b.limit - b.len) {
+        json_buf_fail(b, "JSON byte budget exceeded"); return false;
+    }
+    let required <int> = b.len + extra;
+    if (required <= b.cap) { return true; }
+    let want <int> = b.cap;
+    if (want < 64) { want = 64; }
+    while (want < required) {
+        if (want > b.limit / 2) { want = b.limit; } else { want = want * 2; }
+    }
+    if (want > b.limit) { want = b.limit; }
+    let next <[char]> = new [char, want]{};
+    for (let i <int> = 0; i < b.len; i++) { next[i] = b.data[i]; }
+    if (b.data != null) { delete b.data; }
+    b.data = next; b.cap = want; return true;
+}
 fun json_buf_push(b: &JsonBuf, c: char) <noret> {
-    json_buf_reserve(b, 1);
-    b.data[b.len] = c;
-    b.len = b.len + 1;
+    if (!json_buf_reserve(b, 1)) { return; }
+    b.data[b.len] = c; b.len++;
 }
-
 fun json_buf_append_str(b: &JsonBuf, s: string) <noret> {
-    let m <int> = len(s);
-    if (m == 0) { return; }
-    json_buf_reserve(b, m);
+    if (b.failed) { return; }
+    let remaining <int> = b.limit - b.len;
+    let size <ulong> = json_strnlen(s, cast<ulong>(remaining + 1));
+    if (size > cast<ulong>(remaining)) { json_buf_fail(b, "JSON byte budget exceeded"); return; }
+    let n <int> = cast<int>(size);
+    if (n == 0 || !json_buf_reserve(b, n)) { return; }
     let bytes <[char]> = to_chars(s);
-    for (let i <int> = 0; i < m; i++) { b.data[b.len + i] = bytes[i]; }
-    b.len = b.len + m;
-    delete bytes;
+    for (let i <int> = 0; i < n; i++) { b.data[b.len + i] = bytes[i]; }
+    b.len += n; delete bytes;
 }
-
+fun json_buf_to_string(b: &JsonBuf) <string> {
+    if (b.len == 0) { return clone(""); }
+    return from_chars(b.data, 0, b.len);
+}
+fun json_buf_free(b: &JsonBuf) <noret> {
+    if (b.data != null) { delete b.data; } delete b;
+}
 fun json_buf_push_utf8(b: &JsonBuf, cp: int) <noret> {
-    if (cp < 128) {
-        json_buf_push(b, cast<char>(cp));
-    } else if (cp < 2048) {
-        json_buf_push(b, cast<char>(192 + cp / 64));
-        json_buf_push(b, cast<char>(128 + cp % 64));
+    if (cp < 128) { json_buf_push(b, cast<char>(cp)); }
+    else if (cp < 2048) {
+        json_buf_push(b, cast<char>(192 + cp / 64)); json_buf_push(b, cast<char>(128 + cp % 64));
     } else if (cp < 65536) {
         json_buf_push(b, cast<char>(224 + cp / 4096));
-        json_buf_push(b, cast<char>(128 + (cp / 64) % 64));
-        json_buf_push(b, cast<char>(128 + cp % 64));
+        json_buf_push(b, cast<char>(128 + (cp / 64) % 64)); json_buf_push(b, cast<char>(128 + cp % 64));
     } else {
         json_buf_push(b, cast<char>(240 + cp / 262144));
         json_buf_push(b, cast<char>(128 + (cp / 4096) % 64));
-        json_buf_push(b, cast<char>(128 + (cp / 64) % 64));
-        json_buf_push(b, cast<char>(128 + cp % 64));
+        json_buf_push(b, cast<char>(128 + (cp / 64) % 64)); json_buf_push(b, cast<char>(128 + cp % 64));
     }
 }
-
-fun json_buf_to_string(b: &JsonBuf) <string> {
-    return from_chars(b.data, 0, b.len);
+fun json_byte(c: char) <int> {
+    let n <int> = cast<int>(c); if (n < 0) { n += 256; } return n;
 }
-
-fun json_buf_free(b: &JsonBuf) <noret> {
-    delete b.data;
-    delete b;
+// Returns one Unicode scalar's byte width, or zero. Rejects overlong sequences,
+// isolated continuations, UTF-16 surrogates, truncation and values above U+10FFFF.
+fun json_utf8_width(bytes: [char], pos: int, n: int) <int> {
+    let lead <int> = json_byte(bytes[pos]);
+    if (lead < 128) { return 1; }
+    let width <int> = 0;
+    if (lead >= 194 && lead <= 223) { width = 2; }
+    else if (lead >= 224 && lead <= 239) { width = 3; }
+    else if (lead >= 240 && lead <= 244) { width = 4; }
+    else { return 0; }
+    if (width > n - pos) { return 0; }
+    for (let i <int> = 1; i < width; i++) {
+        let c <int> = json_byte(bytes[pos + i]); if (c < 128 || c > 191) { return 0; }
+    }
+    let second <int> = json_byte(bytes[pos + 1]);
+    if (lead == 224 && second < 160) { return 0; }
+    if (lead == 237 && second > 159) { return 0; }
+    if (lead == 240 && second < 144) { return 0; }
+    if (lead == 244 && second > 143) { return 0; }
+    return width;
 }
-
-// ---------------------------------------------------------------------------
-// Internal: recursive-descent parser. Errors are recorded on the parser
-// struct (no exceptions in Fin); parse_* returns null on failure.
-// ---------------------------------------------------------------------------
 
 struct JsonParser {
-    text <[char]>,
-    n <int>,
-    pos <int>,
-    line <int>,
-    col <int>,
-    failed <bool>,
-    err_line <int>,
-    err_col <int>,
-    err_msg <string>,
+    text <[char]>, n <int>, pos <int>, line <int>, col <int>,
+    failed <bool>, err_line <int>, err_col <int>, err_msg <string>,
+    limits <JsonLimits>, depth <int>, nodes <int>,
 }
-
-fun json_parser_fail(self: &JsonParser, msg: string) <noret> {
-    if (!self.failed) {
-        self.failed = true;
-        self.err_line = self.line;
-        self.err_col = self.col;
-        self.err_msg = clone(msg);
+fun json_parser_fail(p: &JsonParser, msg: string) <noret> {
+    if (!p.failed) {
+        p.failed = true; p.err_line = p.line; p.err_col = p.col; p.err_msg = clone(msg);
     }
 }
-
-fun json_parser_peek(self: &JsonParser) <char> {
-    if (self.pos >= self.n) { return cast<char>(0); }
-    return self.text[self.pos];
+fun json_parser_peek(p: &JsonParser) <char> {
+    if (p.pos >= p.n) { return cast<char>(0); } return p.text[p.pos];
 }
-
-fun json_parser_advance(self: &JsonParser) <char> {
-    let c <char> = json_parser_peek(self);
-    if (self.pos < self.n) {
-        self.pos = self.pos + 1;
-        if (c == '\n') {
-            self.line = self.line + 1;
-            self.col = 1;
-        } else {
-            self.col = self.col + 1;
-        }
+fun json_parser_advance(p: &JsonParser) <char> {
+    let c <char> = json_parser_peek(p);
+    if (p.pos < p.n) {
+        p.pos++; if (c == '\n') { p.line++; p.col = 1; } else { p.col++; }
     }
     return c;
 }
-
-fun json_parser_skip_ws(self: &JsonParser) <noret> {
-    while (self.pos < self.n) {
-        let c <char> = self.text[self.pos];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            json_parser_advance(self);
-        } else {
-            break;
-        }
+fun json_parser_skip_ws(p: &JsonParser) <noret> {
+    while (p.pos < p.n) {
+        let c <char> = p.text[p.pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { json_parser_advance(p); }
+        else { break; }
     }
 }
-
-fun json_parser_hex4(self: &JsonParser) <int> {
+fun json_parser_hex4(p: &JsonParser) <int> {
     let acc <int> = 0;
     for (let i <int> = 0; i < 4; i++) {
-        if (self.pos >= self.n) {
-            json_parser_fail(self, "truncated \\u escape");
-            return 0;
-        }
-        let c <char> = json_parser_advance(self);
-        let d <int> = -1;
+        if (p.pos >= p.n) { json_parser_fail(p, "truncated Unicode escape"); return 0; }
+        let c <char> = json_parser_advance(p); let d <int> = -1;
         if (c >= '0' && c <= '9') { d = cast<int>(c) - cast<int>('0'); }
         else if (c >= 'a' && c <= 'f') { d = cast<int>(c) - cast<int>('a') + 10; }
         else if (c >= 'A' && c <= 'F') { d = cast<int>(c) - cast<int>('A') + 10; }
-        if (d < 0) {
-            json_parser_fail(self, "invalid hex digit in \\u escape");
-            return 0;
-        }
+        if (d < 0) { json_parser_fail(p, "invalid hex digit in Unicode escape"); return 0; }
         acc = acc * 16 + d;
     }
     return acc;
 }
-
-fun json_parse_double(s: string) <double> {
-    let bytes <[char]> = to_chars(s);
-    let n <int> = len(s);
-    let i <int> = 0;
-    let neg <bool> = false;
-    if (n > 0 && bytes[0] == '-') { neg = true; i = 1; }
-    let val <double> = cast<double>(0);
-    while (i < n && bytes[i] >= '0' && bytes[i] <= '9') {
-        val = val * cast<double>(10) + cast<double>(cast<int>(bytes[i]) - cast<int>('0'));
-        i = i + 1;
-    }
-    if (i < n && bytes[i] == '.') {
-        i = i + 1;
-        let place <double> = cast<double>(10);
-        while (i < n && bytes[i] >= '0' && bytes[i] <= '9') {
-            val = val + cast<double>(cast<int>(bytes[i]) - cast<int>('0')) / place;
-            place = place * cast<double>(10);
-            i = i + 1;
-        }
-    }
-    let exp <int> = 0;
-    let expneg <bool> = false;
-    if (i < n && (bytes[i] == 'e' || bytes[i] == 'E')) {
-        i = i + 1;
-        if (i < n && bytes[i] == '-') { expneg = true; i = i + 1; }
-        else if (i < n && bytes[i] == '+') { i = i + 1; }
-        while (i < n && bytes[i] >= '0' && bytes[i] <= '9') {
-            exp = exp * 10 + (cast<int>(bytes[i]) - cast<int>('0'));
-            i = i + 1;
-        }
-    }
-    delete bytes;
-    let scale <double> = cast<double>(1);
-    for (let k <int> = 0; k < exp; k++) { scale = scale * cast<double>(10); }
-    if (expneg) { val = val / scale; } else { val = val * scale; }
-    if (neg) { val = cast<double>(0) - val; }
-    return val;
-}
-
-fun json_parser_string(self: &JsonParser) <string> {
-    // caller has peeked '"'
-    json_parser_advance(self);
-    let buf <&JsonBuf> = json_buf_new();
-    let out <string> = null;
-    while (true) {
-        if (self.pos >= self.n) {
-            json_parser_fail(self, "unterminated string");
-            break;
-        }
-        let c <char> = json_parser_advance(self);
-        if (c == '"') {
-            out = json_buf_to_string(buf);
-            break;
-        }
+fun json_parser_string(p: &JsonParser) <string> {
+    json_parser_advance(p);
+    let buf <&JsonBuf> = json_buf_new(p.limits.max_bytes); let out <string> = null;
+    while (!p.failed && !buf.failed) {
+        if (p.pos >= p.n) { json_parser_fail(p, "unterminated string"); break; }
+        let start <int> = p.pos; let c <char> = json_parser_advance(p);
+        if (c == '"') { out = json_buf_to_string(buf); break; }
         if (c == '\\') {
-            if (self.pos >= self.n) {
-                json_parser_fail(self, "unterminated escape sequence");
-                break;
-            }
-            let e <char> = json_parser_advance(self);
+            if (p.pos >= p.n) { json_parser_fail(p, "unterminated escape sequence"); break; }
+            let e <char> = json_parser_advance(p);
             if (e == '"') { json_buf_push(buf, '"'); }
             else if (e == '\\') { json_buf_push(buf, '\\'); }
             else if (e == '/') { json_buf_push(buf, '/'); }
@@ -456,407 +356,269 @@ fun json_parser_string(self: &JsonParser) <string> {
             else if (e == 'r') { json_buf_push(buf, '\r'); }
             else if (e == 't') { json_buf_push(buf, '\t'); }
             else if (e == 'u') {
-                let cp <int> = json_parser_hex4(self);
-                if (self.failed) { break; }
+                let cp <int> = json_parser_hex4(p); if (p.failed) { break; }
+                if (cp == 0) { json_parser_fail(p, "embedded NUL is unsupported"); break; }
                 if (cp >= 55296 && cp <= 56319) {
-                    // high surrogate: must be followed by \uDC00-\uDFFF
-                    if (self.pos + 6 <= self.n && self.text[self.pos] == '\\' && self.text[self.pos + 1] == 'u') {
-                        self.pos = self.pos + 2;
-                        let lo <int> = json_parser_hex4(self);
-                        if (self.failed) { break; }
-                        if (lo >= 56320 && lo <= 57343) {
-                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
-                        } else {
-                            json_parser_fail(self, "invalid low surrogate");
-                            break;
-                        }
-                    } else {
-                        json_parser_fail(self, "unpaired high surrogate");
-                        break;
+                    if (p.n - p.pos < 6 || p.text[p.pos] != '\\' || p.text[p.pos + 1] != 'u') {
+                        json_parser_fail(p, "unpaired high surrogate"); break;
                     }
+                    json_parser_advance(p); json_parser_advance(p);
+                    let lo <int> = json_parser_hex4(p); if (p.failed) { break; }
+                    if (lo < 56320 || lo > 57343) { json_parser_fail(p, "invalid low surrogate"); break; }
+                    cp = 65536 + (cp - 55296) * 1024 + lo - 56320;
                 } else if (cp >= 56320 && cp <= 57343) {
-                    json_parser_fail(self, "unpaired low surrogate");
-                    break;
+                    json_parser_fail(p, "unpaired low surrogate"); break;
                 }
                 json_buf_push_utf8(buf, cp);
-            }
-            else {
-                json_parser_fail(self, "invalid escape sequence");
-                break;
-            }
+            } else { json_parser_fail(p, "invalid escape sequence"); break; }
         } else {
-            if (c < cast<char>(32) && c >= cast<char>(0)) {
-                json_parser_fail(self, "unescaped control character in string");
-                break;
-            }
+            if (json_byte(c) < 32) { json_parser_fail(p, "unescaped control character in string"); break; }
+            let width <int> = json_utf8_width(p.text, start, p.n);
+            if (width == 0) { json_parser_fail(p, "invalid UTF-8 in string"); break; }
             json_buf_push(buf, c);
+            for (let i <int> = 1; i < width; i++) { json_buf_push(buf, json_parser_advance(p)); }
         }
     }
-    json_buf_free(buf);
-    return out;
+    if (buf.failed) { json_parser_fail(p, buf.message); }
+    json_buf_free(buf); return out;
 }
-
-fun json_parser_match_word(self: &JsonParser, word: string) <bool> {
-    let m <int> = len(word);
-    if (self.pos + m > self.n) { return false; }
-    let wbytes <[char]> = to_chars(word);
-    for (let k <int> = 0; k < m; k++) {
-        if (self.text[self.pos + k] != wbytes[k]) {
-            delete wbytes;
-            return false;
-        }
-    }
-    delete wbytes;
-    if (self.pos + m < self.n) {
-        let c <char> = self.text[self.pos + m];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
-            return false;
-        }
-    }
-    for (let k <int> = 0; k < m; k++) { json_parser_advance(self); }
-    return true;
+fun json_parser_match_word(p: &JsonParser, word: string, n: int) <bool> {
+    if (n > p.n - p.pos) { return false; }
+    let bytes <[char]> = to_chars(word); let same <bool> = true;
+    for (let i <int> = 0; i < n; i++) { if (p.text[p.pos + i] != bytes[i]) { same = false; } }
+    delete bytes;
+    if (same) { for (let i <int> = 0; i < n; i++) { json_parser_advance(p); } }
+    return same;
 }
-
-fun json_parser_literal(self: &JsonParser) <&JsonValue> {
-    if (json_parser_match_word(self, "true")) { return json_bool(true); }
-    if (json_parser_match_word(self, "false")) { return json_bool(false); }
-    if (json_parser_match_word(self, "null")) { return json_null(); }
-    json_parser_fail(self, "invalid literal");
-    return null;
+fun json_parser_literal(p: &JsonParser) <&JsonValue> {
+    if (json_parser_match_word(p, "true", 4)) { return json_bool(true); }
+    if (json_parser_match_word(p, "false", 5)) { return json_bool(false); }
+    if (json_parser_match_word(p, "null", 4)) { return json_null(); }
+    json_parser_fail(p, "invalid literal"); return null;
 }
-
-fun json_parser_number(self: &JsonParser) <&JsonValue> {
-    let start <int> = self.pos;
-    if (json_parser_peek(self) == '-') { json_parser_advance(self); }
-    let c0 <char> = json_parser_peek(self);
-    if (c0 == '0') {
-        json_parser_advance(self);
-    } else if (c0 >= '1' && c0 <= '9') {
-        while (json_parser_peek(self) >= '0' && json_parser_peek(self) <= '9') {
-            json_parser_advance(self);
-        }
-    } else {
-        json_parser_fail(self, "invalid number");
-        return null;
+fun json_digit(c: char) <bool> { return c >= '0' && c <= '9'; }
+fun json_parser_number(p: &JsonParser) <&JsonValue> {
+    let start <int> = p.pos;
+    if (json_parser_peek(p) == '-') { json_parser_advance(p); }
+    let c <char> = json_parser_peek(p);
+    if (c == '0') { json_parser_advance(p); }
+    else if (c >= '1' && c <= '9') {
+        while (json_digit(json_parser_peek(p))) { json_parser_advance(p); }
+    } else { json_parser_fail(p, "invalid number"); return null; }
+    if (json_parser_peek(p) == '.') {
+        json_parser_advance(p);
+        if (!json_digit(json_parser_peek(p))) { json_parser_fail(p, "expected digit after decimal point"); return null; }
+        while (json_digit(json_parser_peek(p))) { json_parser_advance(p); }
     }
-    if (json_parser_peek(self) == '.') {
-        json_parser_advance(self);
-        let d <char> = json_parser_peek(self);
-        if (!(d >= '0' && d <= '9')) {
-            json_parser_fail(self, "expected digit after decimal point");
-            return null;
-        }
-        while (json_parser_peek(self) >= '0' && json_parser_peek(self) <= '9') {
-            json_parser_advance(self);
-        }
-    }
-    let e <char> = json_parser_peek(self);
+    let e <char> = json_parser_peek(p);
     if (e == 'e' || e == 'E') {
-        json_parser_advance(self);
-        let s <char> = json_parser_peek(self);
-        if (s == '+' || s == '-') { json_parser_advance(self); }
-        let d2 <char> = json_parser_peek(self);
-        if (!(d2 >= '0' && d2 <= '9')) {
-            json_parser_fail(self, "expected digit in exponent");
-            return null;
-        }
-        while (json_parser_peek(self) >= '0' && json_parser_peek(self) <= '9') {
-            json_parser_advance(self);
-        }
+        json_parser_advance(p); let sign <char> = json_parser_peek(p);
+        if (sign == '+' || sign == '-') { json_parser_advance(p); }
+        if (!json_digit(json_parser_peek(p))) { json_parser_fail(p, "expected digit in exponent"); return null; }
+        // Scan digits once. Never iterate proportional to the exponent's value.
+        while (json_digit(json_parser_peek(p))) { json_parser_advance(p); }
     }
-    let numtext <string> = from_chars(self.text, start, self.pos - start);
-    let val <double> = json_parse_double(numtext);
-    json_cfree(numtext);
-    return new JsonValue{kind: 2, b: false, num: val,
-                        s: null, items: null, keys: null, vals: null};
+    let token <string> = from_chars(p.text, start, p.pos - start);
+    let end <string> = null;
+    let value <double> = json_strtod(token, &end);
+    let consumed <bool> = end != null && equals(end, "");
+    json_cfree(token);
+    if (!consumed || !json_finite(value)) { json_parser_fail(p, "number is outside finite double range"); return null; }
+    return json_num(value);
 }
-
-fun json_parser_free_children(v: &JsonValue) <noret> {
-    // Frees a partially built array/object after a nested parse failure.
-    let n <int> = 0;
-    if (v.kind == 4) {
-        n = v.items.len();
-        for (let j <int> = 0; j < n; j++) { json_free(v.items.get(j)); }
-        delete v.items;
-    } else {
-        n = v.keys.len();
-        for (let j <int> = 0; j < n; j++) {
-            json_cfree(v.keys.get(j));
-            json_free(v.vals.get(j));
-        }
-        delete v.keys;
-        delete v.vals;
+fun json_parser_array(p: &JsonParser) <&JsonValue> {
+    json_parser_advance(p); let v <&JsonValue> = json_array(); json_parser_skip_ws(p);
+    if (json_parser_peek(p) == ']') { json_parser_advance(p); return v; }
+    while (!p.failed) {
+        if (v.count >= p.limits.max_container) { json_parser_fail(p, "container member budget exceeded"); break; }
+        let item <&JsonValue> = json_parser_value(p);
+        if (p.failed) { break; }
+        json_array_push(v, item); json_parser_skip_ws(p);
+        let c <char> = json_parser_peek(p);
+        if (c == ',') { json_parser_advance(p); }
+        else if (c == ']') { json_parser_advance(p); return v; }
+        else { json_parser_fail(p, "expected ',' or ']' in array"); }
     }
-    delete v;
+    json_free(v); return null;
 }
-
-fun json_parser_array(self: &JsonParser) <&JsonValue> {
-    json_parser_advance(self); // '['
-    let v <&JsonValue> = json_array();
-    json_parser_skip_ws(self);
-    if (json_parser_peek(self) == ']') {
-        json_parser_advance(self);
-        return v;
-    }
-    while (true) {
-        let item <&JsonValue> = json_parser_value(self);
-        if (self.failed) {
-            json_parser_free_children(v);
-            return null;
+fun json_parser_object(p: &JsonParser) <&JsonValue> {
+    json_parser_advance(p); let v <&JsonValue> = json_object(); json_parser_skip_ws(p);
+    if (json_parser_peek(p) == '}') { json_parser_advance(p); return v; }
+    let members <int> = 0;
+    while (!p.failed) {
+        if (members >= p.limits.max_container) { json_parser_fail(p, "container member budget exceeded"); break; }
+        members++; json_parser_skip_ws(p);
+        if (json_parser_peek(p) != '"') { json_parser_fail(p, "expected string key in object"); break; }
+        let key <string> = json_parser_string(p); if (p.failed) { break; }
+        let found <int> = -1;
+        for (let i <int> = 0; i < v.count; i++) { if (equals(v.keys[i], key)) { found = i; break; } }
+        if (found >= 0 && p.limits.reject_duplicates) {
+            json_cfree(key); json_parser_fail(p, "duplicate object key"); break;
         }
-        v.items.push(item);
-        json_parser_skip_ws(self);
-        let c <char> = json_parser_peek(self);
-        if (c == ',') {
-            json_parser_advance(self);
-            json_parser_skip_ws(self);
-        } else if (c == ']') {
-            json_parser_advance(self);
-            break;
-        } else {
-            json_parser_fail(self, "expected ',' or ']' in array");
-            json_parser_free_children(v);
-            return null;
+        json_parser_skip_ws(p);
+        if (json_parser_peek(p) != ':') { json_cfree(key); json_parser_fail(p, "expected ':' after object key"); break; }
+        json_parser_advance(p); let item <&JsonValue> = json_parser_value(p);
+        if (p.failed) { json_cfree(key); break; }
+        if (found >= 0) { json_cfree(key); json_free(v.vals[found]); v.vals[found] = item; }
+        else {
+            json_children_reserve(v); v.keys[v.count] = key; v.vals[v.count] = item; v.count++;
         }
+        json_parser_skip_ws(p); let c <char> = json_parser_peek(p);
+        if (c == ',') { json_parser_advance(p); }
+        else if (c == '}') { json_parser_advance(p); return v; }
+        else { json_parser_fail(p, "expected ',' or '}' in object"); }
     }
-    return v;
+    json_free(v); return null;
 }
-
-fun json_parser_object(self: &JsonParser) <&JsonValue> {
-    json_parser_advance(self); // '{'
-    let v <&JsonValue> = json_object();
-    json_parser_skip_ws(self);
-    if (json_parser_peek(self) == '}') {
-        json_parser_advance(self);
-        return v;
+fun json_parser_value(p: &JsonParser) <&JsonValue> {
+    json_parser_skip_ws(p);
+    if (p.nodes >= p.limits.max_nodes) { json_parser_fail(p, "node budget exceeded"); return null; }
+    p.nodes++;
+    let c <char> = json_parser_peek(p);
+    if (c == '{' || c == '[') {
+        if (p.depth >= p.limits.max_depth) { json_parser_fail(p, "nesting depth budget exceeded"); return null; }
+        p.depth++; let v <&JsonValue> = null;
+        if (c == '{') { v = json_parser_object(p); } else { v = json_parser_array(p); }
+        p.depth--; return v;
     }
-    while (true) {
-        json_parser_skip_ws(self);
-        if (json_parser_peek(self) != '"') {
-            json_parser_fail(self, "expected string key in object");
-            json_parser_free_children(v);
-            return null;
-        }
-        let key <string> = json_parser_string(self);
-        if (self.failed) {
-            json_parser_free_children(v);
-            return null;
-        }
-        json_parser_skip_ws(self);
-        if (json_parser_peek(self) != ':') {
-            json_cfree(key);
-            json_parser_fail(self, "expected ':' after object key");
-            json_parser_free_children(v);
-            return null;
-        }
-        json_parser_advance(self);
-        let item <&JsonValue> = json_parser_value(self);
-        if (self.failed) {
-            json_cfree(key);
-            json_parser_free_children(v);
-            return null;
-        }
-        // duplicate keys: last wins
-        let replaced <bool> = false;
-        let n <int> = v.keys.len();
-        for (let i <int> = 0; i < n; i++) {
-            if (equals(v.keys.get(i), key)) {
-                json_free(v.vals.get(i));
-                v.vals.set(i, item);
-                json_cfree(key);
-                replaced = true;
-                break;
-            }
-        }
-        if (!replaced) {
-            v.keys.push(key);
-            v.vals.push(item);
-        }
-        json_parser_skip_ws(self);
-        let c <char> = json_parser_peek(self);
-        if (c == ',') {
-            json_parser_advance(self);
-        } else if (c == '}') {
-            json_parser_advance(self);
-            break;
-        } else {
-            json_parser_fail(self, "expected ',' or '}' in object");
-            json_parser_free_children(v);
-            return null;
-        }
-    }
-    return v;
-}
-
-fun json_parser_value(self: &JsonParser) <&JsonValue> {
-    json_parser_skip_ws(self);
-    let c <char> = json_parser_peek(self);
-    if (c == '{') { return json_parser_object(self); }
-    if (c == '[') { return json_parser_array(self); }
     if (c == '"') {
-        let s <string> = json_parser_string(self);
-        if (self.failed) { return null; }
-        let v <&JsonValue> = json_str(s);
-        json_cfree(s);
-        return v;
+        let s <string> = json_parser_string(p); if (p.failed) { return null; }
+        let v <&JsonValue> = json_null(); v.kind = 3; v.s = s; return v;
     }
-    if (c == 't' || c == 'f' || c == 'n') { return json_parser_literal(self); }
-    if (c == '-' || (c >= '0' && c <= '9')) { return json_parser_number(self); }
-    json_parser_fail(self, "unexpected character");
-    return null;
+    if (c == 't' || c == 'f' || c == 'n') { return json_parser_literal(p); }
+    if (c == '-' || json_digit(c)) { return json_parser_number(p); }
+    json_parser_fail(p, "unexpected character"); return null;
 }
-
-// ---------------------------------------------------------------------------
-// Public: parse
-// ---------------------------------------------------------------------------
-
+fun json_parse_failure(message: string) <ParseResult> {
+    return ParseResult{ok: false, value: null, err: ParseError{line: 1, col: 1, message: clone(message)}};
+}
 #[export]
-pub fun json_parse(text: string) <ParseResult> {
+pub fun json_parse_with_limits(text: string, limits: JsonLimits) <ParseResult> {
+    if (!json_limits_valid(limits)) { return json_parse_failure("invalid JSON limits"); }
+    if (text == null) { return json_parse_failure("null JSON input"); }
+    let size <ulong> = json_strnlen(text, cast<ulong>(limits.max_bytes + 1));
+    if (size > cast<ulong>(limits.max_bytes)) { return json_parse_failure("input byte budget exceeded"); }
+    if (!json_numeric_locale_ok()) { return json_parse_failure("JSON requires a dot-decimal numeric locale"); }
     let bytes <[char]> = to_chars(text);
-    let p <&JsonParser> = new JsonParser{text: bytes, n: len(text), pos: 0, line: 1, col: 1,
-                                       failed: false, err_line: 0, err_col: 0, err_msg: null};
+    let p <&JsonParser> = new JsonParser{text: bytes, n: cast<int>(size), pos: 0, line: 1, col: 1,
+        failed: false, err_line: 0, err_col: 0, err_msg: null, limits: limits, depth: 0, nodes: 0};
     let v <&JsonValue> = json_parser_value(p);
     if (!p.failed) {
         json_parser_skip_ws(p);
-        if (p.pos < p.n) {
-            json_parser_fail(p, "trailing characters after JSON value");
-            json_free(v);
-            v = null;
-        }
+        if (p.pos < p.n) { json_parser_fail(p, "trailing characters after JSON value"); }
     }
-    let r <ParseResult> = ParseResult{ok: true, value: v,
-                                    err: ParseError{line: 0, col: 0, message: ""}};
+    let r <ParseResult> = ParseResult{ok: true, value: v, err: ParseError{line: 0, col: 0, message: json_null_string()}};
     if (p.failed) {
-        json_free(v);
-        r.ok = false;
-        r.value = null;
-        r.err.line = p.err_line;
-        r.err.col = p.err_col;
-        r.err.message = p.err_msg;
+        json_free(v); r.ok = false; r.value = null;
+        r.err = ParseError{line: p.err_line, col: p.err_col, message: p.err_msg};
     }
-    delete bytes;
-    delete p;
-    return r;
+    delete bytes; delete p; return r;
+}
+#[export]
+pub fun json_parse(text: string) <ParseResult> { return json_parse_with_limits(text, json_default_limits()); }
+#[export]
+pub fun json_parse_strict(text: string) <ParseResult> {
+    let limits <JsonLimits> = json_default_limits(); limits.reject_duplicates = true;
+    return json_parse_with_limits(text, limits);
 }
 
-// ---------------------------------------------------------------------------
-// Internal: serializer
-// ---------------------------------------------------------------------------
-
-fun json_write_indent(b: &JsonBuf, depth: int, indent: int) <noret> {
-    for (let d <int> = 0; d < depth; d++) {
-        for (let s <int> = 0; s < indent; s++) {
-            json_buf_push(b, ' ');
-        }
+struct JsonWriter { buf <&JsonBuf>, limits <JsonLimits>, nodes <int>, indent <int>, pretty <bool>, }
+fun json_write_indent(w: &JsonWriter, depth: int) <noret> {
+    for (let d <int> = 0; d < depth && !w.buf.failed; d++) {
+        for (let i <int> = 0; i < w.indent && !w.buf.failed; i++) { json_buf_push(w.buf, ' '); }
     }
 }
-
 fun json_write_string(b: &JsonBuf, s: string) <noret> {
-    json_buf_push(b, '"');
-    let bytes <[char]> = to_chars(s);
-    let n <int> = len(s);
-    let hex <[char]> = to_chars("0123456789abcdef");
-    for (let i <int> = 0; i < n; i++) {
-        let c <char> = bytes[i];
+    if (b.failed) { return; }
+    if (s == null) { json_buf_fail(b, "null JSON string"); return; }
+    let size <ulong> = json_strnlen(s, cast<ulong>(b.limit + 1));
+    if (size > cast<ulong>(b.limit)) { json_buf_fail(b, "JSON byte budget exceeded"); return; }
+    let n <int> = cast<int>(size); let bytes <[char]> = to_chars(s);
+    let hex <[char]> = to_chars("0123456789abcdef"); json_buf_push(b, '"');
+    let i <int> = 0;
+    while (i < n && !b.failed) {
+        let c <char> = bytes[i]; let ci <int> = json_byte(c);
         if (c == '"') { json_buf_append_str(b, "\\\""); }
         else if (c == '\\') { json_buf_append_str(b, "\\\\"); }
         else if (c == '\n') { json_buf_append_str(b, "\\n"); }
         else if (c == '\r') { json_buf_append_str(b, "\\r"); }
         else if (c == '\t') { json_buf_append_str(b, "\\t"); }
-        else if (c == cast<char>(8)) { json_buf_append_str(b, "\\b"); }
-        else if (c == cast<char>(12)) { json_buf_append_str(b, "\\f"); }
-        else if (c >= cast<char>(0) && c < cast<char>(32)) {
-            let ci <int> = cast<int>(c);
-            json_buf_append_str(b, "\\u00");
-            json_buf_push(b, hex[(ci / 16) % 16]);
-            json_buf_push(b, hex[ci % 16]);
+        else if (ci == 8) { json_buf_append_str(b, "\\b"); }
+        else if (ci == 12) { json_buf_append_str(b, "\\f"); }
+        else if (ci < 32) {
+            json_buf_append_str(b, "\\u00"); json_buf_push(b, hex[ci / 16]); json_buf_push(b, hex[ci % 16]);
+        } else {
+            let width <int> = json_utf8_width(bytes, i, n);
+            if (width == 0) { json_buf_fail(b, "invalid UTF-8 in string"); break; }
+            for (let k <int> = 0; k < width; k++) { json_buf_push(b, bytes[i + k]); }
+            i += width; continue;
         }
-        else { json_buf_push(b, c); }
+        i++;
     }
-    delete hex;
-    delete bytes;
-    json_buf_push(b, '"');
+    delete bytes; delete hex; json_buf_push(b, '"');
 }
-
-fun json_write_value(b: &JsonBuf, v: &JsonValue, pretty: bool, depth: int, indent: int) <noret> {
-    if (v == null || v.kind == 0) {
-        json_buf_append_str(b, "null");
-        return;
-    }
+fun json_write_value(w: &JsonWriter, v: &JsonValue, depth: int) <noret> {
+    let b <&JsonBuf> = w.buf; if (b.failed) { return; }
+    if (w.nodes >= w.limits.max_nodes) { json_buf_fail(b, "node budget exceeded"); return; }
+    w.nodes++;
+    if (v == null || v.kind == 0) { json_buf_append_str(b, "null"); return; }
     if (v.kind == 1) {
-        if (v.b) { json_buf_append_str(b, "true"); } else { json_buf_append_str(b, "false"); }
-        return;
+        if (v.b) { json_buf_append_str(b, "true"); } else { json_buf_append_str(b, "false"); } return;
     }
     if (v.kind == 2) {
+        if (!json_finite(v.num)) { json_buf_fail(b, "nonfinite JSON number"); return; }
         let tmp <string> = json_calloc(cast<ulong>(32), cast<ulong>(1));
-        json_snprintf(tmp, cast<ulong>(32), "%g", v.num);
-        json_buf_append_str(b, tmp);
-        json_cfree(tmp);
-        return;
+        if (tmp == null) { json_buf_fail(b, "number buffer allocation failed"); return; }
+        let size <int> = json_snprintf(tmp, cast<ulong>(32), "%.17g", v.num);
+        if (size < 0 || size >= 32) { json_buf_fail(b, "number formatting failed"); }
+        else { json_buf_append_str(b, tmp); }
+        json_cfree(tmp); return;
     }
-    if (v.kind == 3) {
-        json_write_string(b, v.s);
-        return;
-    }
-    if (v.kind == 4) {
-        json_buf_push(b, '[');
-        let n <int> = v.items.len();
-        for (let i <int> = 0; i < n; i++) {
-            if (i > 0) { json_buf_push(b, ','); }
-            if (pretty) {
-                json_buf_push(b, '\n');
-                json_write_indent(b, depth + 1, indent);
-            }
-            json_write_value(b, v.items.get(i), pretty, depth + 1, indent);
-        }
-        if (pretty && n > 0) {
-            json_buf_push(b, '\n');
-            json_write_indent(b, depth, indent);
-        }
-        json_buf_push(b, ']');
-        return;
-    }
-    json_buf_push(b, '{');
-    let n <int> = v.keys.len();
-    for (let i <int> = 0; i < n; i++) {
+    if (v.kind == 3) { json_write_string(b, v.s); return; }
+    if (v.kind != 4 && v.kind != 5) { json_buf_fail(b, "invalid JSON kind"); return; }
+    if (depth >= w.limits.max_depth) { json_buf_fail(b, "nesting depth budget exceeded"); return; }
+    if (v.count < 0 || v.count > w.limits.max_container) { json_buf_fail(b, "container member budget exceeded"); return; }
+    if (v.kind == 4) { json_buf_push(b, '['); } else { json_buf_push(b, '{'); }
+    for (let i <int> = 0; i < v.count && !b.failed; i++) {
         if (i > 0) { json_buf_push(b, ','); }
-        if (pretty) {
-            json_buf_push(b, '\n');
-            json_write_indent(b, depth + 1, indent);
-        }
-        json_write_string(b, v.keys.get(i));
-        json_buf_push(b, ':');
-        if (pretty) { json_buf_push(b, ' '); }
-        json_write_value(b, v.vals.get(i), pretty, depth + 1, indent);
+        if (w.pretty) { json_buf_push(b, '\n'); json_write_indent(w, depth + 1); }
+        if (v.kind == 5) {
+            json_write_string(b, v.keys[i]); json_buf_push(b, ':');
+            if (w.pretty) { json_buf_push(b, ' '); }
+            json_write_value(w, v.vals[i], depth + 1);
+        } else { json_write_value(w, v.items[i], depth + 1); }
     }
-    if (pretty && n > 0) {
-        json_buf_push(b, '\n');
-        json_write_indent(b, depth, indent);
-    }
-    json_buf_push(b, '}');
+    if (w.pretty && v.count > 0) { json_buf_push(b, '\n'); json_write_indent(w, depth); }
+    if (v.kind == 4) { json_buf_push(b, ']'); } else { json_buf_push(b, '}'); }
 }
-
-// ---------------------------------------------------------------------------
-// Public: serialize. The returned string is malloc'd; free with free_str/free.
-// ---------------------------------------------------------------------------
-
+#[export]
+pub fun json_stringify_with_limits(v: &JsonValue, limits: JsonLimits, pretty: bool, indent: int) <StringifyResult> {
+    if (!json_limits_valid(limits)) { return StringifyResult{ok: false, text: json_null_string(), message: clone("invalid JSON limits")}; }
+    if (indent < 0 || indent > limits.max_output) { return StringifyResult{ok: false, text: json_null_string(), message: clone("invalid JSON indentation")}; }
+    if (!json_numeric_locale_ok()) { return StringifyResult{ok: false, text: json_null_string(), message: clone("JSON requires a dot-decimal numeric locale")}; }
+    let buf <&JsonBuf> = json_buf_new(limits.max_output);
+    let w <&JsonWriter> = new JsonWriter{buf: buf, limits: limits, nodes: 0, indent: indent, pretty: pretty};
+    json_write_value(w, v, 0);
+    let r <StringifyResult> = StringifyResult{ok: true, text: json_null_string(), message: json_null_string()};
+    if (buf.failed) { r.ok = false; r.message = clone(buf.message); }
+    else { r.text = json_buf_to_string(buf); }
+    delete w; json_buf_free(buf); return r;
+}
+#[export]
+pub fun json_stringify_strict(v: &JsonValue) <StringifyResult> {
+    return json_stringify_with_limits(v, json_default_limits(), false, 0);
+}
+// Compatibility wrappers return null on failure; they never return partial or
+// invalid JSON. Use the result API when the diagnostic is needed.
 #[export]
 pub fun json_stringify(v: &JsonValue) <string> {
-    let buf <&JsonBuf> = json_buf_new();
-    json_write_value(buf, v, false, 0, 0);
-    let out <string> = json_buf_to_string(buf);
-    json_buf_free(buf);
-    return out;
+    let r <StringifyResult> = json_stringify_strict(v);
+    if (!r.ok) { json_cfree(r.message); return json_null_string(); } return r.text;
 }
-
 #[export]
 pub fun json_stringify_pretty(v: &JsonValue, indent: int) <string> {
-    blame indent >= 0, "json_stringify_pretty: indent cannot be negative";
-    let buf <&JsonBuf> = json_buf_new();
-    json_write_value(buf, v, true, 0, indent);
-    let out <string> = json_buf_to_string(buf);
-    json_buf_free(buf);
-    return out;
+    let r <StringifyResult> = json_stringify_with_limits(v, json_default_limits(), true, indent);
+    if (!r.ok) { json_cfree(r.message); return json_null_string(); } return r.text;
 }
 
 }

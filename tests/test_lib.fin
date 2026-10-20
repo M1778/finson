@@ -1,6 +1,8 @@
 // Tests for finson. Run: finc -I ../src tests/test_lib.fin -o test_finson && ./test_finson
 import {
-    JsonValue, ParseError, ParseResult,
+    JsonValue, ParseError, ParseResult, JsonLimits, StringifyResult,
+    json_default_limits, json_parse_with_limits, json_parse_strict,
+    json_stringify_with_limits, json_stringify_strict, json_free_stringify_result,
     json_null, json_bool, json_num, json_num_int, json_str, json_array, json_object,
     json_array_push, json_array_len, json_array_get,
     json_object_set, json_object_get, json_object_has, json_object_len,
@@ -8,14 +10,170 @@ import {
     json_parse, json_stringify, json_stringify_pretty
 } from finson::fin;
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
-import { free_str, equals, len, starts_with } from strings::std;
+import { free_str, equals, len, starts_with, from_chars, repeat, concat } from strings::std;
+
+#[llvm_name="strtod"]
+@define test_strtod(s: string, end: &string) <double>;
+#[llvm_name="getenv"]
+@define test_getenv(name: string) <string>;
+#[llvm_name="getchar"]
+@define test_getchar() <int>;
+#[llvm_name="setlocale"]
+@define test_setlocale(category: int, name: string) <string>;
+
+// Newline-delimited driver for differential.py. Each output is JSON or !ERROR.
+fun differential_main() <noret> {
+    let line <[char]> = new [char, 1048577]{}; let used <int> = 0; let overflow <bool> = false;
+    while (true) {
+        let c <int> = test_getchar(); if (c < 0) { break; }
+        if (c == 10) {
+            if (overflow) { printf("!ERROR\n"); }
+            else {
+                let input <string> = from_chars(line, 0, used);
+                let r <ParseResult> = json_parse_strict(input); free_str(input);
+                if (!r.ok) { printf("!ERROR\n"); }
+                else {
+                    let out <StringifyResult> = json_stringify_strict(r.value);
+                    if (!out.ok) { printf("!ERROR\n"); } else { printf("%s\n", out.text); }
+                    json_free_stringify_result(&out);
+                }
+                json_free_result(&r);
+            }
+            used = 0; overflow = false;
+        } else if (used < 1048576) { line[used] = cast<char>(c); used++; }
+        else { overflow = true; }
+    }
+    delete line;
+}
 
 fun check_str(actual: string, expected: string, msg: string) <noret> {
     assert_eq_string(actual, expected, msg);
     free_str(actual);
 }
 
+fun reject(text: string) <noret> {
+    let r <ParseResult> = json_parse_strict(text);
+    assert_true(!r.ok && r.value == null && r.err.message != null, "recoverable parse rejection");
+    json_free_result(&r); json_free_result(&r);
+}
+
+fun expect_limit(text: string, limits: JsonLimits) <noret> {
+    let r <ParseResult> = json_parse_with_limits(text, limits);
+    assert_true(!r.ok && r.value == null, "parse budget rejection"); json_free_result(&r);
+}
+
+fun number_roundtrip(text: string) <noret> {
+    let r <ParseResult> = json_parse(text); assert_true(r.ok, "number parse");
+    let s <StringifyResult> = json_stringify_strict(r.value); assert_true(s.ok, "number serialize");
+    let again <ParseResult> = json_parse(s.text);
+    assert_true(again.ok && again.value.num == r.value.num, "number exact double roundtrip");
+    json_free_result(&again); json_free_stringify_result(&s); json_free_result(&r);
+}
+
+fun hardening_tests() <noret> {
+    reject("\"a\\u0000b\""); reject("{\"role\":\"user\",\"role\\u0000x\":\"admin\"}");
+    reject("{\"exp\":1,\"exp\":2}"); reject("{\"i\\u0073s\":1,\"iss\":2}");
+    reject("{\"aud\":1,\"aud\":2}"); reject("{\"x\":{\"k\":1,\"k\":2}}");
+    reject("\"\\ud800\""); reject("\"\\udc00\""); reject("\"\\ud800\\u0041\"");
+    reject("1e309"); reject("-1e309"); reject("1e2147483647"); reject("1e4294967296");
+    reject("1e999999999999999999999999999999999999999999");
+    reject("NaN"); reject("Infinity"); reject("+1"); reject("1e"); reject("1."); reject("--1");
+    let r <ParseResult> = json_parse("0e309");
+    assert_true(r.ok && r.value.num == cast<double>(0), "zero huge exponent stays zero"); json_free_result(&r);
+    r = json_parse("1e-309"); assert_true(r.ok && r.value.num > cast<double>(0), "preserve subnormal"); json_free_result(&r);
+    r = json_parse("1e-999999999999999999999999");
+    assert_true(r.ok && r.value.num == cast<double>(0), "underflow rounds to zero"); json_free_result(&r);
+    number_roundtrip("1000001"); number_roundtrip("0.12345678901234567"); number_roundtrip("9007199254740991");
+    number_roundtrip("1.7976931348623157e308"); number_roundtrip("5e-324"); number_roundtrip("1e-309");
+    r = json_parse("-0"); check_str(json_stringify(r.value), "-0", "negative zero preserved"); json_free_result(&r);
+    r = json_parse("\"\\ud83d\\ude00\""); assert_true(r.ok && len(r.value.s) == 4, "surrogate pair UTF8"); json_free_result(&r);
+    r = json_parse("[\"\\ud83d\\ude00\" x]");
+    assert_true(!r.ok && r.err.col == 17, "surrogate pair tracks exact error column"); json_free_result(&r);
+
+    // Invalid raw encodings in strings and keys, including overlong/surrogate/out-of-range forms.
+    let raw <[char]> = new [char, 7]{};
+    raw[0] = '"'; raw[1] = cast<char>(255); raw[2] = '"';
+    let text <string> = from_chars(raw, 0, 3); reject(text); free_str(text);
+    raw[1] = cast<char>(192); raw[2] = cast<char>(175); raw[3] = '"';
+    text = from_chars(raw, 0, 4); reject(text); free_str(text);
+    raw[1] = cast<char>(237); raw[2] = cast<char>(160); raw[3] = cast<char>(128); raw[4] = '"';
+    text = from_chars(raw, 0, 5); reject(text); free_str(text);
+    raw[1] = cast<char>(244); raw[2] = cast<char>(144); raw[3] = cast<char>(128); raw[4] = cast<char>(128); raw[5] = '"';
+    text = from_chars(raw, 0, 6); reject(text); free_str(text);
+    raw[1] = cast<char>(128); raw[2] = '"'; text = from_chars(raw, 0, 3); reject(text); free_str(text);
+    raw[1] = cast<char>(226); raw[2] = cast<char>(130); text = from_chars(raw, 0, 3); reject(text); free_str(text);
+    raw[0] = cast<char>(255); text = from_chars(raw, 0, 1);
+    let v <&JsonValue> = json_str(text); free_str(text); delete raw;
+    let sr <StringifyResult> = json_stringify_strict(v);
+    assert_true(!sr.ok && sr.text == null, "serializer rejects invalid UTF8"); json_free_stringify_result(&sr); json_free(v);
+
+    let end <string> = null;
+    v = json_num(test_strtod("inf", &end)); sr = json_stringify_strict(v);
+    assert_true(!sr.ok && json_stringify(v) == null, "nonfinite result and compatibility failure");
+    json_free_stringify_result(&sr); json_free(v);
+    v = json_num(test_strtod("nan", &end)); sr = json_stringify_strict(v);
+    assert_true(!sr.ok, "reject NaN serialization"); json_free_stringify_result(&sr); json_free(v);
+
+    let limits <JsonLimits> = json_default_limits(); limits.max_bytes = 3; expect_limit("null", limits);
+    limits.max_bytes = 4; r = json_parse_with_limits("null", limits); assert_true(r.ok, "exact input byte limit"); json_free_result(&r);
+    limits = json_default_limits(); limits.max_nodes = 2; expect_limit("[1,2]", limits);
+    limits.max_nodes = 3; r = json_parse_with_limits("[1,2]", limits); assert_true(r.ok, "exact node limit"); json_free_result(&r);
+    limits = json_default_limits(); limits.max_container = 1; expect_limit("[1,2]", limits); expect_limit("{\"a\":1,\"a\":2}", limits);
+    limits.max_container = 0; r = json_parse_with_limits("{}", limits); assert_true(r.ok, "empty container zero members"); json_free_result(&r);
+    limits = json_default_limits(); limits.max_depth = 0; expect_limit("[]", limits);
+    limits.max_depth = 1; r = json_parse_with_limits("[0]", limits); assert_true(r.ok, "one container level"); json_free_result(&r); expect_limit("[[]]", limits);
+    limits.max_depth = 257; expect_limit("0", limits);
+    limits = json_default_limits(); limits.max_bytes = 2147483647; expect_limit("0", limits);
+    limits = json_default_limits(); limits.max_output = -1; expect_limit("0", limits);
+    limits = json_default_limits(); limits.reject_duplicates = true; expect_limit("{\"a\":1,\"a\":2}", limits);
+    let left <string> = repeat("[", 128); let right <string> = repeat("]", 128);
+    let prefix <string> = concat(left, "0"); text = concat(prefix, right);
+    free_str(left); free_str(right); free_str(prefix);
+    r = json_parse(text); assert_true(r.ok, "default depth boundary succeeds");
+    sr = json_stringify_strict(r.value); assert_true(sr.ok, "depth boundary serializes");
+    json_free_stringify_result(&sr); json_free_result(&r); free_str(text);
+    text = repeat("[", 100000); reject(text); free_str(text);
+    text = repeat(" ", 1048577); reject(text); free_str(text);
+    limits = json_default_limits(); limits.max_output = 8;
+    v = json_array(); json_array_push(v, json_null());
+    sr = json_stringify_with_limits(v, limits, true, 8);
+    assert_true(!sr.ok && sr.text == null, "pretty expansion bounded"); json_free_stringify_result(&sr); json_free(v);
+    limits.max_output = 3; v = json_null(); sr = json_stringify_with_limits(v, limits, false, 0);
+    assert_true(!sr.ok && sr.text == null, "output byte limit"); json_free_stringify_result(&sr);
+    limits.max_output = 4; sr = json_stringify_with_limits(v, limits, false, 0);
+    assert_true(sr.ok && equals(sr.text, "null"), "exact output byte limit"); json_free_stringify_result(&sr);
+    limits.max_nodes = 0; sr = json_stringify_with_limits(v, limits, false, 0);
+    assert_true(!sr.ok, "serializer node budget"); json_free_stringify_result(&sr); json_free(v);
+    limits = json_default_limits(); v = json_array(); json_array_push(v, json_null());
+    limits.max_container = 0; sr = json_stringify_with_limits(v, limits, false, 0);
+    assert_true(!sr.ok, "serializer member budget"); json_free_stringify_result(&sr);
+    limits = json_default_limits(); limits.max_depth = 0; sr = json_stringify_with_limits(v, limits, false, 0);
+    assert_true(!sr.ok, "serializer depth budget"); json_free_stringify_result(&sr);
+    assert_true(json_stringify_pretty(v, -1) == null, "negative indent returns failure"); json_free(v);
+
+    // Success, duplicate replacement and nested partial-failure ownership loops.
+    for (let i <int> = 0; i < 2000; i++) {
+        r = json_parse("{\"a\":[1,2,3,4,5],\"b\":{\"c\":\"hello\"},\"a\":[6,7]}");
+        assert_true(r.ok, "ownership loop parse"); sr = json_stringify_strict(r.value);
+        assert_true(sr.ok, "ownership loop serialize"); json_free_stringify_result(&sr); json_free_result(&r);
+        reject("{\"a\":[1,2,3,4,5],\"b\":{\"c\":[1,2,}} ");
+        reject("{\"a\":[1],\"a\":[2]}"); reject("[{},[],\"bad\\u0000\"]");
+    }
+}
+
 fun main() <noret> {
+    let locale <string> = test_getenv("FINSON_TEST_LOCALE");
+    if (locale != null) {
+        // Linux LC_NUMERIC. This test-only driver never changes production locale.
+        assert_true(test_setlocale(1, locale) != null, "test locale installed");
+        let r <ParseResult> = json_parse("1.5");
+        assert_true(!r.ok, "non-dot locale fails explicitly"); json_free_result(&r);
+        let v <&JsonValue> = json_num(cast<double>(1.5));
+        let sr <StringifyResult> = json_stringify_strict(v);
+        assert_true(!sr.ok, "non-dot serializer locale fails explicitly");
+        json_free_stringify_result(&sr); json_free(v); return;
+    }
+    if (test_getenv("FINSON_DIFFERENTIAL") != null) { differential_main(); return; }
     // --- literals ---
     let r <ParseResult> = json_parse("null");
     assert_true(r.ok, "parse null: ok");
@@ -201,16 +359,18 @@ fun main() <noret> {
     json_array_push(arr, json_num_int(1));
     json_array_push(arr, json_num_int(2));
     json_object_set(obj, "list", arr);
-    check_str(json_stringify(obj), "{\"name\":\"fin\",\"version\":0.4,\"stable\":false,\"nothing\":null,\"list\":[1,2]}", "stringify compact");
+    check_str(json_stringify(obj), "{\"name\":\"fin\",\"version\":0.40000000000000002,\"stable\":false,\"nothing\":null,\"list\":[1,2]}", "stringify compact");
 
     check_str(json_stringify_pretty(obj, 2),
-        "{\n  \"name\": \"fin\",\n  \"version\": 0.4,\n  \"stable\": false,\n  \"nothing\": null,\n  \"list\": [\n    1,\n    2\n  ]\n}",
+        "{\n  \"name\": \"fin\",\n  \"version\": 0.40000000000000002,\n  \"stable\": false,\n  \"nothing\": null,\n  \"list\": [\n    1,\n    2\n  ]\n}",
         "stringify pretty");
 
     // replace existing key
     json_object_set(obj, "name", json_str("finson"));
     assert_eq_string(json_object_get(obj, "name").s, "finson", "object_set replaces");
     assert_eq_int(json_object_len(obj), 5, "object_set replace keeps len");
+    json_object_set(obj, "name", json_object_get(obj, "name"));
+    assert_eq_string(json_object_get(obj, "name").s, "finson", "object_set same pointer no-op");
     json_free(obj);
 
     // string escaping on output
@@ -236,5 +396,6 @@ fun main() <noret> {
     assert_eq_string(json_kind_name(4), "array", "kind_name array");
     assert_true(!equals(json_kind_name(1), "nope"), "kind_name bool sane");
 
+    hardening_tests();
     printf("finson: all tests passed\n");
 }
