@@ -326,7 +326,9 @@ python3 -I tests/differential.py ./test_finson_asan
 
 `FINSON_TEST_LOCALE` selects an installed non-dot locale to check the explicit
 locale rejection. `python3 scripts/fin_header.py --repo finson --license MIT
---check .` verifies the source headers.
+--check finson.fin tests examples scripts .github/scripts` verifies the source
+headers (scope it to those paths; a bare `.` also walks the installed toolchain
+under `.finc`).
 
 ## Changelog
 
