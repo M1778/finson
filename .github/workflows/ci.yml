@@ -11,6 +11,14 @@ on:
 # `::add-path::`: that workflow command was retired, so a runner silently ignores
 # it and the next step finds no `finc`. All steps use bash, including Windows,
 # so one spelling of the path works everywhere.
+#
+# FIN_LDFLAGS=-lm is load-bearing. `finc` appends a link line meant for the
+# compiler's own object (which calls the LLVM C API), so the default is
+# `-lLLVM-<major>`. A program this repository compiles references no LLVM symbol
+# (checked with `nm -u`), so the library is not needed and requiring it would
+# force every runner to install a matching LLVM. Only libm is used.
+env:
+  FIN_LDFLAGS: "-lm"
 
 jobs:
   test:
