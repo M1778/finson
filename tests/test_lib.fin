@@ -31,7 +31,7 @@ import {
     json_object_set, json_object_get, json_object_has, json_object_len,
     json_kind_name, json_free, json_free_result,
     json_parse, json_stringify, json_stringify_pretty
-} from finson::fin;
+} from "../finson.fin";
 import { assert_true, assert_eq_int, assert_eq_string } from testing::std;
 import { free_str, equals, len, starts_with, from_chars, repeat, concat } from strings::std;
 
@@ -108,6 +108,21 @@ fun hardening_tests() <noret> {
     assert_true(r.ok && r.value.num == cast<double>(0), "underflow rounds to zero"); json_free_result(&r);
     number_roundtrip("1000001"); number_roundtrip("0.12345678901234567"); number_roundtrip("9007199254740991");
     number_roundtrip("1.7976931348623157e308"); number_roundtrip("5e-324"); number_roundtrip("1e-309");
+    // Integer boundaries. JSON numbers are doubles by contract, so past 2^53 the
+    // value is the nearest double (documented), never a wrap to a small number and
+    // never an overflow into a nonfinite result.
+    r = json_parse("9223372036854775808");
+    assert_true(r.ok && r.value.num == cast<double>(9223372036854775808.0), "int64 overflow parses as double"); json_free_result(&r);
+    r = json_parse("18446744073709551616");
+    // 2^64 is exactly representable as a double, so the nearest value equals it;
+    // the contract is "nearest double", not "wraps to a small int".
+    let two32 <double> = cast<double>(4294967296);
+    let two64 <double> = two32 * two32;
+    assert_true(r.ok && r.value.num == two64, "uint64 overflow parses as 2^64 double"); json_free_result(&r);
+    r = json_parse("9007199254740993");
+    assert_true(r.ok && r.value.num == cast<double>(9007199254740992), "2^53+1 rounds to nearest double"); json_free_result(&r);
+    let int_v <&JsonValue> = json_num_int(2147483647); check_str(json_stringify(int_v), "2147483647", "json_num_int int_max"); json_free(int_v);
+    int_v = json_num_int(-2147483648); check_str(json_stringify(int_v), "-2147483648", "json_num_int int_min"); json_free(int_v);
     r = json_parse("-0"); check_str(json_stringify(r.value), "-0", "negative zero preserved"); json_free_result(&r);
     r = json_parse("\"\\ud83d\\ude00\""); assert_true(r.ok && len(r.value.s) == 4, "surrogate pair UTF8"); json_free_result(&r);
     r = json_parse("[\"\\ud83d\\ude00\" x]");
@@ -184,7 +199,60 @@ fun hardening_tests() <noret> {
     }
 }
 
+// Builders are a trust boundary too: a caller that forwards an untrusted key or
+// string must get a diagnostic, not a strcmp/strlen on a null pointer. Those
+// diagnostics are `blame`, which aborts, so they are proved by a probe mode that
+// the verification script runs and expects to fail (see tests/run_probe.py).
+fun builder_probe(mode: string) <noret> {
+    let null_text <string> = null;
+    let obj <&JsonValue> = json_object();
+    // A populated object is what makes a null key reach strcmp; an empty one
+    // never enters the loop and would hide the defect.
+    json_object_set(obj, "present", json_null());
+    if (equals(mode, "null_key_get")) {
+        let got <&JsonValue> = json_object_get(obj, null_text);
+        printf("unreachable: get returned %d\n", got == null);
+    } else if (equals(mode, "null_key_set")) {
+        json_object_set(obj, null_text, json_null());
+        printf("unreachable: set returned\n");
+    } else if (equals(mode, "null_key_has")) {
+        let has <bool> = json_object_has(obj, null_text);
+        printf("unreachable: has returned %d\n", has);
+    } else if (equals(mode, "null_string")) {
+        let v <&JsonValue> = json_str(null_text);
+        printf("unreachable: json_str returned %d\n", v != null);
+    }
+    printf("unreachable: unknown probe mode\n");
+    json_free(obj);
+}
+
+// The documented parse budget bounds trees that come from json_parse, but the
+// builder API has no depth ceiling: json_array_push accepts any tree a caller can
+// assemble. Freeing must therefore not recurse, or a 200k-deep builder tree
+// exhausts the call stack in json_free itself (SIGSEGV, not a diagnostic).
+fun deep_free_test() <noret> {
+    let depth <int> = 400000;
+    let root <&JsonValue> = json_null();
+    for (let i <int> = 0; i < depth; i++) {
+        let level <&JsonValue> = json_array();
+        json_array_push(level, root);
+        root = level;
+    }
+    json_free(root);
+    // Objects nest through vals, which is the other child array json_free walks.
+    let obj_root <&JsonValue> = json_null();
+    for (let i <int> = 0; i < depth; i++) {
+        let level <&JsonValue> = json_object();
+        json_object_set(level, "k", obj_root);
+        obj_root = level;
+    }
+    json_free(obj_root);
+    printf("deep free ok\n");
+}
+
 fun main() <noret> {
+    let probe <string> = test_getenv("FINSON_PROBE");
+    if (probe != null) { builder_probe(probe); return; }
     let locale <string> = test_getenv("FINSON_TEST_LOCALE");
     if (locale != null) {
         // Linux LC_NUMERIC. This test-only driver never changes production locale.
@@ -420,5 +488,6 @@ fun main() <noret> {
     assert_true(!equals(json_kind_name(1), "nope"), "kind_name bool sane");
 
     hardening_tests();
+    deep_free_test();
     printf("finson: all tests passed\n");
 }
