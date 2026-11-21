@@ -42,8 +42,13 @@ Requires the `finn` package manager (https://github.com/M1778/finn) and a
 `finc` with a working LLVM backend and a C linker driver.
 
 ```sh
-finn add https://github.com/M1778/finson
+```sh
+finn add --yes https://github.com/M1778/finson
 ```
+
+No registry resolves these names yet, so `--yes` is required: without it `finn add`
+refuses a source the register has not vouched for rather than installing it unasked.
+Drop the flag once a registry entry exists.
 
 The package root carries the module, so `import ... from finson::fin` resolves
 once finn has installed it. Without finn, compile with the package root on the

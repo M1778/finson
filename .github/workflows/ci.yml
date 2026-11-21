@@ -1,37 +1,45 @@
 name: CI
 
+# The compiler comes from a pinned published release, not from a source build.
+#
+# This used to clone M1778/Fin and run ./build.sh, which cost twenty minutes per job and
+# needed Conan, CMake, Flex, Bison and LLVM 22 on every runner. Worse, it tested whatever
+# the compiler's master happened to be that morning: a red run could not be attributed
+# without reading a second repository.
+#
+# FINC_VERSION pins it, and .github/scripts/install_finc.py verifies the archive's sha256
+# against the release index before unpacking it.
+#
+# EVERY lane compiles AND executes a real program. A type-check is not a test, and a lane
+# that only checks has not run the library.
+#
+# FIN_LDFLAGS is load-bearing and platform-specific. `finc` appends a link line written for
+# its own object, which calls the LLVM C API, so the default is `-lLLVM-<major>`. A program
+# compiled here references no LLVM symbol (checked with `nm -u`: libc and libm only), and
+# requiring it would force every runner to install a matching LLVM. MSVC has no separate
+# libm -- the CRT supplies those symbols -- and `-lm` becomes a request for `m.lib`, which
+# does not exist, so the Windows job clears the variable to its own default.
+
 on:
   push:
     branches: [master, main, "production/**"]
   pull_request:
 
-# Every lane compiles AND executes the test program. A type-check is not a test.
-#
-# The compiler path is passed explicitly through FINC rather than relying on
-# `::add-path::`: that workflow command was retired, so a runner silently ignores
-# it and the next step finds no `finc`. All steps use bash, including Windows,
-# so one spelling of the path works everywhere.
-#
-# FIN_LDFLAGS is load-bearing and platform-specific. `finc` appends a link line
-# meant for the compiler's own object, which calls the LLVM C API, so the default
-# is `-lLLVM-<major>`. A program this repository compiles references no LLVM
-# symbol (checked with `nm -u`), and requiring the library would force every
-# runner to install a matching LLVM, including the macOS keg that default looks
-# for. On Linux and macOS only libm is used. MSVC has no separate libm -- the
-# CRT supplies it -- and `-lm` becomes a request for `m.lib`, which does not
-# exist, so the flag is left empty there.
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
+      # One platform's failure must not cancel the other two: the point of the matrix is
+      # to find out which platforms are broken.
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
+        os: [ubuntu-latest, macos-15, windows-latest]
     env:
-      # Replaced per job below; MSVC cannot link -lm.
       FIN_LDFLAGS: "-lm"
     steps:
       - uses: actions/checkout@v4
@@ -40,32 +48,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Provide the LLVM runtime the macOS compiler links against
-        if: runner.os == 'macOS'
+      - name: Install the pinned finc
         shell: bash
-        run: |
-          set -euo pipefail
-          # The published darwin finc records an absolute dependency on
-          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
-          # does not ship Homebrew. Without this the binary dies in dyld before
-          # it can print --version.
-          brew install llvm@22
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
 
-      - name: Install the pinned compiler
+      - name: Put finc on PATH and choose the platform link line
         shell: bash
         run: |
           set -euo pipefail
-          python .github/scripts/install_finc.py
-          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
-
-      - name: Show compiler and choose the link line
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          FINC="$RUNNER_TEMP/finc/bin/finc"
           "$FINC" --version
-          # clang on Windows drives link.exe, which has no separate libm: `-lm`
-          # is a request for m.lib, which does not exist. An empty value makes
-          # finc fall back to its own Windows default (-lws2_32).
+          # The published darwin artifact records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and `macos-15` ships no
+          # Homebrew, so install the runtime before asking for any other work.
+          if [ "$RUNNER_OS" = "macOS" ] && ! "$FINC" --version >/dev/null 2>&1; then
+            brew install llvm@22
+            "$FINC" --version
+          fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             {
               echo "FIN_LDFLAGS<<FINSON_ENV_EOF"
@@ -73,40 +73,45 @@ jobs:
               echo "FINSON_ENV_EOF"
             } >> "$GITHUB_ENV"
           fi
-          # finc writes exactly the -o path, so the executable suffix is chosen
-          # here rather than guessed by the shell later.
+          # finc writes exactly the -o path; it does not append .exe.
           exe=""
           case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exe=".exe" ;; esac
           echo "FINSON_EXE=$exe" >> "$GITHUB_ENV"
 
-      - name: Build and run the test suite
+      - name: Type-check the library
+        shell: bash
+        run: finc finson.fin
+
+      - name: Build and run the tests
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" tests/test_lib.fin -o "test_finson$FINSON_EXE"
-          "./test_finson$FINSON_EXE"
+          finc tests/test_lib.fin -o "$RUNNER_TEMP/test_lib$FINSON_EXE"
+          "$RUNNER_TEMP/test_lib$FINSON_EXE"
 
       - name: Build and run the example
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" examples/basic.fin -o "example_basic$FINSON_EXE"
-          "./example_basic$FINSON_EXE"
+          finc examples/basic.fin -o "$RUNNER_TEMP/example_basic$FINSON_EXE"
+          "$RUNNER_TEMP/example_basic$FINSON_EXE"
 
       - name: Builder diagnostics fire as named (a SIGSEGV fails this)
         shell: bash
-        run: python -I tests/probe_failures.py "./test_finson$FINSON_EXE"
+        run: python -I tests/probe_failures.py "$RUNNER_TEMP/test_lib$FINSON_EXE"
 
+  # The differential oracle compares parse and stringify against Python's json. It needs a
+  # real executable, so it runs where one is cheap and native.
   differential:
     name: differential (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      FIN_LDFLAGS: "-lm"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-latest, macos-15]
+    env:
+      FIN_LDFLAGS: "-lm"
     steps:
       - uses: actions/checkout@v4
 
@@ -114,37 +119,34 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Provide the LLVM runtime the macOS compiler links against
-        if: runner.os == 'macOS'
+      - name: Install the pinned finc
         shell: bash
-        run: |
-          set -euo pipefail
-          # The published darwin finc records an absolute dependency on
-          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
-          # does not ship Homebrew. Without this the binary dies in dyld before
-          # it can print --version.
-          brew install llvm@22
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
 
-      - name: Install the pinned compiler
+      - name: Put finc on PATH
         shell: bash
         run: |
           set -euo pipefail
-          python .github/scripts/install_finc.py
-          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          FINC="$RUNNER_TEMP/finc/bin/finc"
+          if ! "$FINC" --version >/dev/null 2>&1; then
+            brew install llvm@22
+          fi
+          "$FINC" --version
 
       - name: Build
         shell: bash
-        run: '"$FINC" tests/test_lib.fin -o test_finson'
+        run: finc tests/test_lib.fin -o "$RUNNER_TEMP/test_lib"
 
       - name: Compare parse and stringify against Python's json
         shell: bash
-        run: python -I tests/differential.py ./test_finson
+        run: python -I tests/differential.py "$RUNNER_TEMP/test_lib"
 
   # The ownership contract is a runtime property, so it gets a runtime checker.
   # AddressSanitizer is Linux-only because that is where a prebuilt one is cheap.
   sanitizers:
     name: asan + -O2 (linux)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       FIN_LDFLAGS: "-lm"
@@ -155,38 +157,30 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Provide the LLVM runtime the macOS compiler links against
-        if: runner.os == 'macOS'
+      - name: Install the pinned finc
         shell: bash
-        run: |
-          set -euo pipefail
-          # The published darwin finc records an absolute dependency on
-          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
-          # does not ship Homebrew. Without this the binary dies in dyld before
-          # it can print --version.
-          brew install llvm@22
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
 
-      - name: Install the pinned compiler
+      - name: Put finc on PATH
         shell: bash
         run: |
-          set -euo pipefail
-          python .github/scripts/install_finc.py
-          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/finc/bin/finc" --version
 
       - name: Suite, probes and differential under AddressSanitizer
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" -O0 -c tests/test_lib.fin -o test_finson.o
-          cc -fsanitize=address -g test_finson.o -o test_finson_asan
-          ./test_finson_asan
-          python -I tests/probe_failures.py ./test_finson_asan
-          python -I tests/differential.py ./test_finson_asan
+          finc -O0 -c tests/test_lib.fin -o "$RUNNER_TEMP/test_finson.o"
+          cc -fsanitize=address -g "$RUNNER_TEMP/test_finson.o" -o "$RUNNER_TEMP/test_finson_asan"
+          "$RUNNER_TEMP/test_finson_asan"
+          python -I tests/probe_failures.py "$RUNNER_TEMP/test_finson_asan"
+          python -I tests/differential.py "$RUNNER_TEMP/test_finson_asan"
 
       - name: Optimized build
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" -O2 tests/test_lib.fin -o test_finson_o2
-          ./test_finson_o2
-          python -I tests/differential.py ./test_finson_o2
+          finc -O2 tests/test_lib.fin -o "$RUNNER_TEMP/test_finson_o2"
+          "$RUNNER_TEMP/test_finson_o2"
+          python -I tests/differential.py "$RUNNER_TEMP/test_finson_o2"
