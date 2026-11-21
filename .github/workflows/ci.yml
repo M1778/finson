@@ -37,25 +37,32 @@ jobs:
 
       - name: Show compiler
         shell: bash
-        run: '"$FINC" --version'
+        run: |
+          set -euo pipefail
+          "$FINC" --version
+          # finc writes exactly the -o path, so the executable suffix is chosen
+          # here rather than guessed by the shell later.
+          exe=""
+          case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exe=".exe" ;; esac
+          echo "FINSON_EXE=$exe" >> "$GITHUB_ENV"
 
       - name: Build and run the test suite
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" tests/test_lib.fin -o test_finson
-          ./test_finson
+          "$FINC" tests/test_lib.fin -o "test_finson$FINSON_EXE"
+          "./test_finson$FINSON_EXE"
 
       - name: Build and run the example
         shell: bash
         run: |
           set -euo pipefail
-          "$FINC" examples/basic.fin -o example_basic
-          ./example_basic
+          "$FINC" examples/basic.fin -o "example_basic$FINSON_EXE"
+          "./example_basic$FINSON_EXE"
 
       - name: Builder diagnostics fire as named (a SIGSEGV fails this)
         shell: bash
-        run: python -I tests/probe_failures.py ./test_finson
+        run: python -I tests/probe_failures.py "./test_finson$FINSON_EXE"
 
   differential:
     name: differential (${{ matrix.os }})
