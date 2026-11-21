@@ -5,9 +5,14 @@ on:
     branches: [master, main, "production/**"]
   pull_request:
 
+# Every lane compiles AND executes the test program. A type-check is not a test.
+#
+# The compiler path is passed explicitly through FINC rather than relying on
+# `::add-path::`: that workflow command was retired, so a runner silently ignores
+# it and the next step finds no `finc`. All steps use bash, including Windows,
+# so one spelling of the path works everywhere.
+
 jobs:
-  # Compile and execute the real test programs. A type-check is not a test:
-  # every lane here links and runs tests/test_lib.fin.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -15,13 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            triple: x86_64-unknown-linux-musl
-          - os: macos-14
-            triple: aarch64-apple-darwin
-          - os: windows-2022
-            triple: x86_64-pc-windows-msvc
+        os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,33 +28,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pinned finc
-        run: python .github/scripts/install_finc.py
+      - name: Install the pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/install_finc.py
+          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
 
       - name: Show compiler
         shell: bash
-        run: finc --version
+        run: '"$FINC" --version'
 
       - name: Build and run the test suite
         shell: bash
         run: |
           set -euo pipefail
-          finc tests/test_lib.fin -o test_finson
+          "$FINC" tests/test_lib.fin -o test_finson
           ./test_finson
 
       - name: Build and run the example
         shell: bash
         run: |
           set -euo pipefail
-          finc examples/basic.fin -o example_basic
+          "$FINC" examples/basic.fin -o example_basic
           ./example_basic
 
-      - name: Builder diagnostics fire as named (SIGSEGV would fail this)
+      - name: Builder diagnostics fire as named (a SIGSEGV fails this)
         shell: bash
         run: python -I tests/probe_failures.py ./test_finson
 
-  # The differential oracle compares parse/stringify against Python's json.
-  # It needs a real executable, so it runs where one is cheap and native.
   differential:
     name: differential (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -71,23 +72,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pinned finc
-        run: python .github/scripts/install_finc.py
+      - name: Install the pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/install_finc.py
+          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
-        run: |
-          set -euo pipefail
-          finc tests/test_lib.fin -o test_finson
+        run: '"$FINC" tests/test_lib.fin -o test_finson'
 
-      - name: Compare against Python's json
+      - name: Compare parse and stringify against Python's json
         shell: bash
-        run: |
-          set -euo pipefail
-          python -I tests/differential.py ./test_finson
+        run: python -I tests/differential.py ./test_finson
 
-  # Leak-checked and optimized lanes: the ownership contract is a runtime
-  # property, so AddressSanitizer (Linux) and -O2 (both) are separate proofs.
+  # The ownership contract is a runtime property, so it gets a runtime checker.
+  # AddressSanitizer is Linux-only because that is where a prebuilt one is cheap.
   sanitizers:
     name: asan + -O2 (linux)
     runs-on: ubuntu-24.04
@@ -99,28 +100,27 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pinned finc
-        run: python .github/scripts/install_finc.py
-
-      - name: Every allocation-owning path under AddressSanitizer
+      - name: Install the pinned compiler
         shell: bash
         run: |
           set -euo pipefail
-          finc -O0 -c tests/test_lib.fin -o test_finson.o
+          python .github/scripts/install_finc.py
+          echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
+
+      - name: Suite, probes and differential under AddressSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$FINC" -O0 -c tests/test_lib.fin -o test_finson.o
           cc -fsanitize=address -g test_finson.o -o test_finson_asan
           ./test_finson_asan
           python -I tests/probe_failures.py ./test_finson_asan
-
-      - name: Differential suite under AddressSanitizer
-        shell: bash
-        run: |
-          set -euo pipefail
           python -I tests/differential.py ./test_finson_asan
 
       - name: Optimized build
         shell: bash
         run: |
           set -euo pipefail
-          finc -O2 tests/test_lib.fin -o test_finson_o2
+          "$FINC" -O2 tests/test_lib.fin -o test_finson_o2
           ./test_finson_o2
           python -I tests/differential.py ./test_finson_o2
