@@ -90,6 +90,8 @@ jobs:
     name: differential (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      FIN_LDFLAGS: "-lm"
     strategy:
       fail-fast: false
       matrix:
@@ -122,6 +124,8 @@ jobs:
     name: asan + -O2 (linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      FIN_LDFLAGS: "-lm"
     steps:
       - uses: actions/checkout@v4
 
