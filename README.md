@@ -13,8 +13,12 @@ compact or pretty-printed JSON.
 Requires the `finn` package manager (https://github.com/M1778/finn):
 
 ```sh
-finn add M1778/finson
+finn add --yes M1778/finson
 ```
+
+No registry resolves these names yet, so `--yes` is required: without it `finn add` refuses
+a source the register has not vouched for rather than installing it unasked. Drop the flag
+once a registry entry exists.
 
 ## Quick Example
 
