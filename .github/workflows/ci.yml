@@ -40,6 +40,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Provide the LLVM runtime the macOS compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
+          # does not ship Homebrew. Without this the binary dies in dyld before
+          # it can print --version.
+          brew install llvm@22
+
       - name: Install the pinned compiler
         shell: bash
         run: |
@@ -103,6 +114,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Provide the LLVM runtime the macOS compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
+          # does not ship Homebrew. Without this the binary dies in dyld before
+          # it can print --version.
+          brew install llvm@22
+
       - name: Install the pinned compiler
         shell: bash
         run: |
@@ -132,6 +154,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Provide the LLVM runtime the macOS compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and the runner image
+          # does not ship Homebrew. Without this the binary dies in dyld before
+          # it can print --version.
+          brew install llvm@22
 
       - name: Install the pinned compiler
         shell: bash
