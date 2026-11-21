@@ -2,68 +2,125 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "production/**"]
   pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  # Compile and execute the real test programs. A type-check is not a test:
+  # every lane here links and runs tests/test_lib.fin.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-musl
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: windows-2022
+            triple: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build bison flex python3 pipx clang gpg curl git
-          pipx install conan
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Install LLVM 22
-        run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm-22-dev clang-22 libllvm22
-
-      - name: Restore finc toolchain cache
-        id: finc-restore
-        uses: actions/cache/restore@v4
+      - uses: actions/setup-python@v5
         with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
+          python-version: "3.12"
 
-      - name: Build finc (on cache miss)
-        if: steps.finc-restore.outputs.cache-hit != 'true'
+      - name: Install pinned finc
+        run: python .github/scripts/install_finc.py
+
+      - name: Show compiler
+        shell: bash
+        run: finc --version
+
+      - name: Build and run the test suite
+        shell: bash
         run: |
-          export PATH="$HOME/.local/bin:/usr/lib/llvm-22/bin:$PATH"
-          git clone --depth 1 https://github.com/M1778/Fin.git /tmp/Fin
-          cd /tmp/Fin && ./build.sh --release --no-test
+          set -euo pipefail
+          finc tests/test_lib.fin -o test_finson
+          ./test_finson
 
-      - name: Save finc toolchain cache
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+      - name: Build and run the example
+        shell: bash
+        run: |
+          set -euo pipefail
+          finc examples/basic.fin -o example_basic
+          ./example_basic
+
+      - name: Builder diagnostics fire as named (SIGSEGV would fail this)
+        shell: bash
+        run: python -I tests/probe_failures.py ./test_finson
+
+  # The differential oracle compares parse/stringify against Python's json.
+  # It needs a real executable, so it runs where one is cheap and native.
+  differential:
+    name: differential (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
+          python-version: "3.12"
 
-      - name: finc version
-        run: |
-          echo "/tmp/Fin/build" >> "$GITHUB_PATH"
-          /tmp/Fin/build/finc --version
+      - name: Install pinned finc
+        run: python .github/scripts/install_finc.py
 
-      - name: Frontend check
+      - name: Build
+        shell: bash
         run: |
-          finc src/finson.fin
+          set -euo pipefail
+          finc tests/test_lib.fin -o test_finson
 
-      - name: Build and run tests
+      - name: Compare against Python's json
+        shell: bash
         run: |
-          finc tests/test_lib.fin -I src -o test_finson && ./test_finson
+          set -euo pipefail
+          python -I tests/differential.py ./test_finson
 
-      - name: Build and run example
+  # Leak-checked and optimized lanes: the ownership contract is a runtime
+  # property, so AddressSanitizer (Linux) and -O2 (both) are separate proofs.
+  sanitizers:
+    name: asan + -O2 (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned finc
+        run: python .github/scripts/install_finc.py
+
+      - name: Every allocation-owning path under AddressSanitizer
+        shell: bash
         run: |
-          finc examples/basic.fin -I src -o example_basic && ./example_basic
+          set -euo pipefail
+          finc -O0 -c tests/test_lib.fin -o test_finson.o
+          cc -fsanitize=address -g test_finson.o -o test_finson_asan
+          ./test_finson_asan
+          python -I tests/probe_failures.py ./test_finson_asan
+
+      - name: Differential suite under AddressSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I tests/differential.py ./test_finson_asan
+
+      - name: Optimized build
+        shell: bash
+        run: |
+          set -euo pipefail
+          finc -O2 tests/test_lib.fin -o test_finson_o2
+          ./test_finson_o2
+          python -I tests/differential.py ./test_finson_o2

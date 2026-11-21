@@ -1,5 +1,12 @@
 .finn/
 out/
 *.o
+*.obj
 *.exe
 test_finson
+test_finson_o2
+test_finson_asan
+example_basic
+example_basic.exe
+.finc/
+__pycache__/
