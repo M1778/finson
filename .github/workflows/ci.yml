@@ -48,6 +48,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Provide the LLVM runtime the darwin compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib. The runner ships no
+          # Homebrew, and the installer correctly refuses a compiler whose
+          # --version dies in dyld, so the runtime has to be there first.
+          brew install llvm@22
+
       - name: Install the pinned finc
         shell: bash
         run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
@@ -59,13 +69,6 @@ jobs:
           echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
           FINC="$RUNNER_TEMP/finc/bin/finc"
           "$FINC" --version
-          # The published darwin artifact records an absolute dependency on
-          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib, and `macos-15` ships no
-          # Homebrew, so install the runtime before asking for any other work.
-          if [ "$RUNNER_OS" = "macOS" ] && ! "$FINC" --version >/dev/null 2>&1; then
-            brew install llvm@22
-            "$FINC" --version
-          fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             {
               echo "FIN_LDFLAGS<<FINSON_ENV_EOF"
@@ -119,6 +122,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Provide the LLVM runtime the darwin compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib. The runner ships no
+          # Homebrew, and the installer correctly refuses a compiler whose
+          # --version dies in dyld, so the runtime has to be there first.
+          brew install llvm@22
+
       - name: Install the pinned finc
         shell: bash
         run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
@@ -129,9 +142,6 @@ jobs:
           set -euo pipefail
           echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
           FINC="$RUNNER_TEMP/finc/bin/finc"
-          if ! "$FINC" --version >/dev/null 2>&1; then
-            brew install llvm@22
-          fi
           "$FINC" --version
 
       - name: Build
@@ -156,6 +166,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Provide the LLVM runtime the darwin compiler links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The published darwin finc records an absolute dependency on
+          # /opt/homebrew/opt/llvm@22/lib/libLLVM.dylib. The runner ships no
+          # Homebrew, and the installer correctly refuses a compiler whose
+          # --version dies in dyld, so the runtime has to be there first.
+          brew install llvm@22
 
       - name: Install the pinned finc
         shell: bash
