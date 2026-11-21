@@ -12,13 +12,14 @@ on:
 # it and the next step finds no `finc`. All steps use bash, including Windows,
 # so one spelling of the path works everywhere.
 #
-# FIN_LDFLAGS=-lm is load-bearing. `finc` appends a link line meant for the
-# compiler's own object (which calls the LLVM C API), so the default is
-# `-lLLVM-<major>`. A program this repository compiles references no LLVM symbol
-# (checked with `nm -u`), so the library is not needed and requiring it would
-# force every runner to install a matching LLVM. Only libm is used.
-env:
-  FIN_LDFLAGS: "-lm"
+# FIN_LDFLAGS is load-bearing and platform-specific. `finc` appends a link line
+# meant for the compiler's own object, which calls the LLVM C API, so the default
+# is `-lLLVM-<major>`. A program this repository compiles references no LLVM
+# symbol (checked with `nm -u`), and requiring the library would force every
+# runner to install a matching LLVM, including the macOS keg that default looks
+# for. On Linux and macOS only libm is used. MSVC has no separate libm -- the
+# CRT supplies it -- and `-lm` becomes a request for `m.lib`, which does not
+# exist, so the flag is left empty there.
 
 jobs:
   test:
@@ -29,6 +30,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14, windows-2022]
+    env:
+      # Replaced per job below; MSVC cannot link -lm.
+      FIN_LDFLAGS: "-lm"
     steps:
       - uses: actions/checkout@v4
 
@@ -43,11 +47,21 @@ jobs:
           python .github/scripts/install_finc.py
           echo "FINC=$PWD/.finc/bin/finc" >> "$GITHUB_ENV"
 
-      - name: Show compiler
+      - name: Show compiler and choose the link line
         shell: bash
         run: |
           set -euo pipefail
           "$FINC" --version
+          # clang on Windows drives link.exe, which has no separate libm: `-lm`
+          # is a request for m.lib, which does not exist. An empty value makes
+          # finc fall back to its own Windows default (-lws2_32).
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            {
+              echo "FIN_LDFLAGS<<FINSON_ENV_EOF"
+              echo ""
+              echo "FINSON_ENV_EOF"
+            } >> "$GITHUB_ENV"
+          fi
           # finc writes exactly the -o path, so the executable suffix is chosen
           # here rather than guessed by the shell later.
           exe=""
