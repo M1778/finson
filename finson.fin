@@ -1,3 +1,26 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/finson
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of finson, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
 // finson — bounded JSON parsing and serialization for Fin.
 // Values own their strings and child arrays; accessors return borrowed pointers.
 // Strings are NUL-terminated: embedded NUL is rejected, never silently truncated.
@@ -94,6 +117,9 @@ pub fun json_num(n: double) <&JsonValue> {
 pub fun json_num_int(n: int) <&JsonValue> { return json_num(cast<double>(n)); }
 #[export]
 pub fun json_str(s: string) <&JsonValue> {
+    // A null source is refused rather than copied: strlen(null) is a crash and a
+    // caller forwarding an untrusted string must get a diagnostic.
+    blame s != null, "json_str: null string";
     let v <&JsonValue> = json_null(); v.kind = 3; v.s = clone(s); return v;
 }
 #[export]
@@ -149,6 +175,7 @@ pub fun json_array_get(v: &JsonValue, i: int) <&JsonValue> {
 pub fun json_object_set(v: &JsonValue, key: string, item: &JsonValue) <noret> {
     blame v != null, "json_object_set: null value";
     blame v.kind == 5, "json_object_set: not an object";
+    blame key != null, "json_object_set: null key";
     for (let i <int> = 0; i < v.count; i++) {
         if (equals(v.keys[i], key)) {
             if (v.vals[i] != item) { json_free(v.vals[i]); v.vals[i] = item; }
@@ -165,6 +192,9 @@ pub fun json_object_set(v: &JsonValue, key: string, item: &JsonValue) <noret> {
 pub fun json_object_get(v: &JsonValue, key: string) <&JsonValue> {
     blame v != null, "json_object_get: null value";
     blame v.kind == 5, "json_object_get: not an object";
+    // A null key is a caller bug, not "not found": silencing it would hide the
+    // duplicate-key bug that follows. blame is this library's diagnostic.
+    blame key != null, "json_object_get: null key";
     for (let i <int> = 0; i < v.count; i++) {
         if (equals(v.keys[i], key)) { return v.vals[i]; }
     }
@@ -188,17 +218,49 @@ pub fun json_kind_name(k: int) <string> {
 #[export]
 pub fun json_free(v: &JsonValue) <noret> {
     if (v == null) { return; }
-    if (v.kind == 3) { json_cfree(v.s); }
-    if (v.kind == 4) {
-        for (let i <int> = 0; i < v.count; i++) { json_free(v.items[i]); }
-        if (v.items != null) { delete v.items; }
+    // The parse budget bounds trees from json_parse, but the builder API sets no
+    // depth ceiling: json_array_push/json_object_set accept any tree a caller can
+    // assemble. Recursing here meant a deep builder tree crashed the free itself
+    // (around 300k levels on an 8 MiB stack, far fewer on Windows' 1 MiB), so the
+    // walk keeps its own stack and json_free stays O(1) in call depth.
+    let cap <int> = 64;
+    let stack <[&JsonValue]> = new [&JsonValue, cap]{};
+    let n <int> = 0;
+    stack[n] = v; n++;
+    while (n > 0) {
+        n--;
+        let cur <&JsonValue> = stack[n];
+        if (cur == null) { continue; }
+        if (cur.kind == 3) { json_cfree(cur.s); }
+        if (cur.kind == 4) {
+            if (cur.count > 0) {
+                while (n + cur.count > cap) {
+                    let bigger <[&JsonValue]> = new [&JsonValue, cap * 2]{};
+                    for (let i <int> = 0; i < n; i++) { bigger[i] = stack[i]; }
+                    delete stack;
+                    stack = bigger; cap = cap * 2;
+                }
+                for (let i <int> = 0; i < cur.count; i++) { stack[n] = cur.items[i]; n++; }
+            }
+            if (cur.items != null) { delete cur.items; }
+        }
+        if (cur.kind == 5) {
+            for (let i <int> = 0; i < cur.count; i++) { json_cfree(cur.keys[i]); }
+            if (cur.count > 0) {
+                while (n + cur.count > cap) {
+                    let bigger <[&JsonValue]> = new [&JsonValue, cap * 2]{};
+                    for (let i <int> = 0; i < n; i++) { bigger[i] = stack[i]; }
+                    delete stack;
+                    stack = bigger; cap = cap * 2;
+                }
+                for (let i <int> = 0; i < cur.count; i++) { stack[n] = cur.vals[i]; n++; }
+            }
+            if (cur.keys != null) { delete cur.keys; }
+            if (cur.vals != null) { delete cur.vals; }
+        }
+        delete cur;
     }
-    if (v.kind == 5) {
-        for (let i <int> = 0; i < v.count; i++) { json_cfree(v.keys[i]); json_free(v.vals[i]); }
-        if (v.keys != null) { delete v.keys; }
-        if (v.vals != null) { delete v.vals; }
-    }
-    delete v;
+    delete stack;
 }
 #[export]
 pub fun json_free_result(r: &ParseResult) <noret> {
