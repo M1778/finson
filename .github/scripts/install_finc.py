@@ -106,6 +106,20 @@ def unpack(archive: Path, dest: Path) -> None:
             tf.extractall(dest)
 
 
+def announce_bin(dest: Path) -> None:
+    """Publish the bin directory through the mechanism Actions actually has.
+
+    `::add-path::` was retired in 2020 and a runner now treats it as an error,
+    which failed the whole install step. GITHUB_PATH is the supported file-based
+    replacement; outside Actions there is no file and nothing to announce.
+    """
+    print(f"finc bin directory: {dest / 'bin'}")
+    handle = os.environ.get("GITHUB_PATH")
+    if handle:
+        with open(handle, "a", encoding="utf-8") as out:
+            out.write(f"{dest / 'bin'}\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", help="defaults to the FINC_VERSION file")
@@ -134,7 +148,7 @@ def main() -> int:
         )
         if out.returncode == 0:
             print(f"finc already installed: {out.stdout.strip()}")
-            print(f"::add-path::{dest / 'bin'}")
+            announce_bin(dest)
             return 0
         print("cached finc does not answer --version; reinstalling", file=sys.stderr)
 
@@ -240,8 +254,7 @@ def main() -> int:
         )
         return 1
 
-    # GitHub Actions picks this up; harmless elsewhere.
-    print(f"::add-path::{dest / 'bin'}")
+    announce_bin(dest)
     return 0
 
 
